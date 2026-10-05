@@ -10,6 +10,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.activity.compose.BackHandler
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
@@ -31,6 +32,7 @@ import com.qaqh.harness.data.pairing.PairingPayloadException
 import com.qaqh.harness.data.pairing.StoredCredentials
 import com.qaqh.harness.ui.home.HomeScreen
 import com.qaqh.harness.ui.pairing.PairingScreen
+import com.qaqh.harness.ui.session.SessionScreen
 import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {
@@ -40,7 +42,7 @@ class MainActivity : FragmentActivity() {
         setContent {
             MaterialTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    AppRoot(Modifier.padding(innerPadding))
+                    AppRoot(innerPadding, Modifier)
                 }
             }
         }
@@ -48,7 +50,7 @@ class MainActivity : FragmentActivity() {
 }
 
 @Composable
-fun AppRoot(modifier: Modifier = Modifier) {
+fun AppRoot(innerPadding: androidx.compose.foundation.layout.PaddingValues, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val store = remember { CredentialStore(context) }
     var credentials by remember { mutableStateOf<StoredCredentials?>(store.load()) }
@@ -73,6 +75,9 @@ fun AppRoot(modifier: Modifier = Modifier) {
     LaunchedEffect(credentials) {
         if (credentials != null) ConnectionService.start(context)
     }
+
+    // 两级导航：会话列表 ↔ 聊天屏
+    var openSessionId by remember { mutableStateOf<String?>(null) }
 
     if (credentials == null) {
         PairingScreen(
@@ -117,14 +122,26 @@ fun AppRoot(modifier: Modifier = Modifier) {
             },
         )
     } else {
-        HomeScreen(
-            credentials = credentials!!,
-            onUnpair = {
-                ConnectionService.stop(context)
-                store.clear()
-                credentials = null
-            },
-            modifier = modifier,
-        )
+        val creds = credentials!!
+        if (openSessionId == null) {
+            HomeScreen(
+                credentials = creds,
+                onUnpair = {
+                    ConnectionService.stop(context)
+                    store.clear()
+                    credentials = null
+                    openSessionId = null
+                },
+                onOpenSession = { openSessionId = it },
+                modifier = modifier.padding(innerPadding),
+            )
+        } else {
+            BackHandler { openSessionId = null }
+            SessionScreen(
+                sessionId = openSessionId!!,
+                onBack = { openSessionId = null },
+                modifier = Modifier.padding(top = innerPadding.calculateTopPadding()),
+            )
+        }
     }
 }

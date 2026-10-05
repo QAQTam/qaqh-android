@@ -134,6 +134,20 @@ data class CommandEnvelope(
             put("autonomous", false)
         }
 
+        /** 构造 session_create 命令体（control 通道；driver 门控，无人认领时放行）。 */
+        fun sessionCreate(): JsonObject = buildJsonObject {
+            put("channel", RingingProtocol.CHANNEL_CONTROL)
+            put("type", "session_create")
+            put("close_current", false)
+        }
+
+        /** 构造 conversation_send_message 命令体（conversation 通道，需 driver seat 或无人认领）。 */
+        fun conversationSendMessage(text: String): JsonObject = buildJsonObject {
+            put("channel", RingingProtocol.CHANNEL_CONVERSATION)
+            put("type", "conversation_send_message")
+            put("text", text)
+        }
+
         /** 构造 SessionAttach 命令体（control 通道，只读订阅归属；content/owns_session 校验的前提）。 */
         fun sessionAttach(sessionId: String): JsonObject = buildJsonObject {
             put("channel", RingingProtocol.CHANNEL_CONTROL)

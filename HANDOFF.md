@@ -24,7 +24,7 @@
 - ✅ 扫码/手输配对 → 前台服务连接 → `session.list` 会话发现 → Home 卡片（模型/轮次/running）→ bootstrap 活动投影（空闲徽标）→ 挂起交互快照投影（重启不丢）。
 - ✅ 修复：Android 9+ 默认禁明文 HTTP 导致首次配对失败 → Manifest 加 `android:usesCleartextTraffic="true"`（**P5 上 TLS 后应收掉并换 networkSecurityConfig**）。
 - ✅ 交互应答扩展：permission/plan/ask 三类命令分派（`respondInteraction`），ask 暂只有"关闭交互"；应答失败/被拒显示在 Home。
-- ⚠️ **远程审批命令卡在 daemon：手机的 `tool_permission_respond` 被 daemon 受理但 worker 从不消费（TUI 不收敛）。已定位为 daemon 侧 bug——所有 ringing 命令（含 webui 的 ULID 命令、多租约、2487 条 stuck 告警）全部卡 Running。Bug 报告已挂 `qaqh-backend/docs/bug-ringing-v2-commands-stuck-in-running.md`，等后端修复后手机批准链路应即刻可用（wire 格式已被 daemon 验收）。**
+- ⚠️ **远程审批卡 Running（已修复）**：最初怀疑投递路径是错的。实际根因 = 归因→回执折叠断链（hub-fact-bus 2.3 迁 fact 链后写侧未接 causation；`engine_turn.rs` 的 `is_ulid` 把安卓 UUID 命令 id 丢成 None）。后端已修：FactCausation 统一归因 + UUID 归一进 ULID 通道 + 补 DriverChanged 折叠臂 + 过期 receipt 摘除。daemon 已重启跑新构建（2026-10-05 16:16）。详见 `qaqh-backend/docs/bug-ringing-v2-commands-stuck-in-running.md`。
 - 待真机验证：审批通知的 Live Update 倒计时样式、BiometricPrompt（弹窗正常但端到端被上述 bug 挡住）、同意/拒绝真正生效。
 - client 侧遗留（后端修复后做）：`SessionAttach` 未实现（owns_session 收紧后会成硬要求）；ask 交互的回答表单（`interaction_ask_respond` 需解析提问结构 + `question_id`）；`content_ref` 型请求的内容拉取（`/content/{id}`）以显示摘要原文。
 - 版本坑：**AGP 9 内置 Kotlin**，不能再用 `org.jetbrains.kotlin.android` 插件；Compose Compiler 插件（`org.jetbrains.kotlin.plugin.compose`）仍需保留。最新 Compose 库要求 compileSdk ≥ 37。

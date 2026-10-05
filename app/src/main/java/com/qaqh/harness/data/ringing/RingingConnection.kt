@@ -141,6 +141,32 @@ class RingingConnection(
         else -> error("未知交互类型 $kind")
     }
 
+    /**
+     * 发送用户消息（conversation 通道，driver 门控）。
+     * 无人认领时直接放行；被拒（not_driver）则先 claim 再重试一次。
+     */
+    suspend fun sendUserMessage(text: String): CommandAck {
+        val ack = postCommand(RingingProtocol.CHANNEL_CONVERSATION, CommandEnvelope.conversationSendMessage(text))
+        if (ack.status == "rejected" && ack.code == "not_driver") {
+            val sid = mutex.withLock { clientSessionId } ?: error("not connected")
+            val seed = mutex.withLock { sessionId }
+            api.driverClaim(sid, seed ?: error("no session"))
+            return postCommand(RingingProtocol.CHANNEL_CONVERSATION, CommandEnvelope.conversationSendMessage(text))
+        }
+        return ack
+    }
+
+    /** 新建会话（control 通道）；被拒 not_driver 时先 claim 再重试一次。 */
+    suspend fun createSession(): CommandAck {
+        val ack = postCommand(RingingProtocol.CHANNEL_CONTROL, CommandEnvelope.sessionCreate())
+        if (ack.status == "rejected" && ack.code == "not_driver") {
+            val sid = mutex.withLock { clientSessionId } ?: error("not connected")
+            api.driverClaim(sid, mutex.withLock { sessionId } ?: error("no session"))
+            return postCommand(RingingProtocol.CHANNEL_CONTROL, CommandEnvelope.sessionCreate())
+        }
+        return ack
+    }
+
     private suspend fun postCommand(channel: String, command: kotlinx.serialization.json.JsonObject): CommandAck {
         val sid = mutex.withLock { clientSessionId } ?: error("not connected")
         val sessionId = mutex.withLock { sessionId }
@@ -180,8 +206,15 @@ class RingingConnection(
         mutex.withLock {
             clientSessionId = open.clientSessionId
             serverEpoch = open.serverEpoch
-            _state.value = State.Connected(open.serverEpoch, open.clientSessionId)
         }
+        // attach 要在 Connected 置位前完成：timeline/content 等 attach 门控接口依赖它
+        val knownSessionId = mutex.withLock { sessionId }
+        if (knownSessionId != null) {
+            runCatching { postCommand(RingingProtocol.CHANNEL_CONTROL, CommandEnvelope.sessionAttach(knownSessionId)) }
+                .onSuccess { android.util.Log.i(TAG, "attach ok lease=${open.clientSessionId.take(8)} session=${knownSessionId.take(12)} ack=${it.status} ${it.code ?: ""}") }
+                .onFailure { android.util.Log.w(TAG, "attach FAILED: $it") }
+        }
+        mutex.withLock { _state.value = State.Connected(open.serverEpoch, open.clientSessionId) }
         startRenewLoop(open.renewIntervalMs)
     }
 
@@ -287,5 +320,9 @@ class RingingConnection(
                 _events.tryEmit(SessionEvent.InteractionExpired(it.interactionId, it.reason))
             }
         }
+    }
+
+    private companion object {
+        const val TAG = "RingingConnection"
     }
 }

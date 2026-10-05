@@ -96,18 +96,16 @@ class ConnectionService : Service() {
 
     /** 每 15s 发现一次活跃会话；session_id 变化时切换事件流。 */
     private suspend fun sessionDiscoveryLoop(conn: RingingConnection) {
-        var currentSeed: String? = null
+        var currentSessionId: String? = null
         while (scope.isActive) {
             delay(15_000)
-            val sid = (_connectionState.value as? RingingConnection.State.Connected)?.clientSessionId ?: continue
-            val sessions = runCatching { withTimeoutOrNull(10_000) { conn.api.sessionList(sid) } }.getOrNull()
-                ?: continue
+            val sessions = refreshSessions(conn)
             if (sessions.isEmpty()) continue
             val target = sessions.firstOrNull { it.running }
                 ?: sessions.maxByOrNull { it.updatedAt }
                 ?: continue
-            if (target.sessionId != currentSeed) {
-                currentSeed = target.sessionId
+            if (target.sessionId != currentSessionId) {
+                currentSessionId = target.sessionId
                 _sessionInfo.value = target
                 conn.setSessionId(target.sessionId)
             }
@@ -288,8 +286,41 @@ class ConnectionService : Service() {
         private val _sessionInfo = MutableStateFlow<com.qaqh.harness.data.ringing.model.SessionListEntry?>(null)
         val sessionInfo: StateFlow<com.qaqh.harness.data.ringing.model.SessionListEntry?> = _sessionInfo.asStateFlow()
 
+        private val _sessions = MutableStateFlow<List<com.qaqh.harness.data.ringing.model.SessionListEntry>>(emptyList())
+        val sessions: StateFlow<List<com.qaqh.harness.data.ringing.model.SessionListEntry>> = _sessions.asStateFlow()
+
+        /** 立即刷新会话列表（进入列表屏/下拉刷新时调用）。 */
+        fun refreshNow(scope: kotlinx.coroutines.CoroutineScope) {
+            val conn = connection ?: return
+            scope.launch { refreshSessions(conn) }
+        }
+
+        private suspend fun refreshSessions(conn: RingingConnection): List<com.qaqh.harness.data.ringing.model.SessionListEntry> {
+            val sid = (_connectionState.value as? RingingConnection.State.Connected)?.clientSessionId ?: run {
+                android.util.Log.w("ConnectionService", "refresh: not connected yet")
+                return emptyList()
+            }
+            val sessions = runCatching { withTimeoutOrNull(10_000) { conn.api.sessionList(sid) } }
+                .onFailure { android.util.Log.w("ConnectionService", "sessionList failed", it) }
+                .getOrNull() ?: return emptyList()
+            // 过滤 daemon 内部临时会话（.tmp* 等，bootstrap 404）
+            val visible = sessions.filterNot { it.sessionId.startsWith(".") }
+            android.util.Log.i("ConnectionService", "sessions: ${sessions.size} raw, ${visible.size} visible")
+            _sessions.value = visible
+            return visible
+        }
+
+        /** 用户显式选择会话（进入聊天屏时调用），覆盖自动发现的选择。 */
+        fun selectSession(sessionId: String) {
+            connection?.setSessionId(sessionId)
+            _sessionInfo.value = _sessions.value.firstOrNull { it.sessionId == sessionId }
+        }
+
         @Volatile
         private var connection: RingingConnection? = null
+
+        /** 会话屏直接借用当前连接（timeline/发消息）；未连接返回 null。 */
+        fun activeConnection(): RingingConnection? = connection
 
         private val _lastRespondError = MutableStateFlow<String?>(null)
         val lastRespondError: StateFlow<String?> = _lastRespondError.asStateFlow()

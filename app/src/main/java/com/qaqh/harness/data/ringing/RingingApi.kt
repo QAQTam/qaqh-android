@@ -11,6 +11,10 @@ import com.qaqh.harness.data.ringing.model.RenewResponse
 import com.qaqh.harness.data.ringing.model.ResetRequired
 import com.qaqh.harness.data.ringing.model.RingingProtocol
 import com.qaqh.harness.data.ringing.model.SessionListEntry
+import com.qaqh.harness.data.ringing.model.TimelineEntryEnvelope
+import com.qaqh.harness.data.ringing.model.TimelineEntryFrame
+import com.qaqh.harness.data.ringing.model.TimelineResponse
+import com.qaqh.harness.data.ringing.model.DriverClaimResponse
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.channels.trySendBlocking
 import kotlinx.coroutines.flow.Flow
@@ -43,6 +47,11 @@ class RingingApi(
     }
 
     private val http = client ?: OkHttpClient.Builder().build()
+
+    /** SSE 专用：readTimeout=0，空闲长连接不被 10s 默认读超时掐断。 */
+    private val sseHttp = (client ?: OkHttpClient()).newBuilder()
+        .readTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .build()
     private val baseUrl = baseUrl.trimEnd('/')
     private val jsonMedia = "application/json".toMediaType()
 
@@ -106,6 +115,69 @@ class RingingApi(
             .post(json.encodeToString(CommandEnvelope.serializer(), envelope).toRequestBody(jsonMedia))
             .build()
     )
+
+    /** GET /sessions/{session_id}/timeline?before_index=&limit= — 聊天时间线分页（要求 attach）。 */
+    fun timeline(clientSessionId: String, sessionId: String, beforeIndex: Long? = null, limit: Int = 30): TimelineResponse {
+        val url = (baseUrl + RingingProtocol.BASE_PATH + "/sessions/$sessionId/timeline").toHttpUrl()
+            .newBuilder()
+            .apply {
+                if (beforeIndex != null) addQueryParameter("before_index", beforeIndex.toString())
+                addQueryParameter("limit", limit.toString())
+            }
+            .build()
+        return execute(Request.Builder().url(url)
+            .header("Authorization", "Bearer $token")
+            .header("X-QAQH-Client-Session-Id", clientSessionId)
+            .get().build())
+    }
+
+    /** POST /sessions/{session_id}/driver/claim — 认领 driver 席位（发会话命令前需要）。 */
+    fun driverClaim(clientSessionId: String, sessionId: String): DriverClaimResponse =
+        execute(
+            requestBuilder("/sessions/$sessionId/driver/claim", clientSessionId)
+                .post(EMPTY_JSON.toRequestBody(jsonMedia))
+                .build()
+        )
+
+    /** GET /sessions/{session_id}/timeline/events — 聊天实时增量（event: timeline.entry / ringing.stream_terminated）。 */
+    fun timelineEvents(clientSessionId: String, sessionId: String): Flow<TimelineSseEvent> = callbackFlow {
+        val url = (baseUrl + RingingProtocol.BASE_PATH + "/sessions/$sessionId/timeline/events").toHttpUrl()
+        val request = Request.Builder().url(url)
+            .header("Authorization", "Bearer $token")
+            .header("X-QAQH-Client-Session-Id", clientSessionId)
+            .header("Accept", "text/event-stream")
+            .build()
+        lateinit var source: EventSource
+        source = EventSources.createFactory(sseHttp).newEventSource(request, object : EventSourceListener() {
+            override fun onOpen(eventSource: EventSource, response: Response) {
+                if (!response.isSuccessful) {
+                    val body = runCatching { response.body?.string() }.getOrNull().orEmpty()
+                    close(throwApiException(response, body))
+                }
+            }
+
+            override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
+                when (type) {
+                    EVENT_STREAM_TERMINATED -> trySendBlocking(TimelineSseEvent.Terminated)
+                    else -> runCatching {
+                        TimelineSseEvent.Entry(json.decodeFromString<TimelineEntryEnvelope>(data).entry)
+                    }.onSuccess { trySendBlocking(it) }
+                }
+            }
+
+            override fun onClosed(eventSource: EventSource) { close() }
+
+            override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
+                close(t ?: ApiException(response?.code ?: 0, null, "timeline SSE failure"))
+            }
+        })
+        awaitClose { source.cancel() }
+    }
+
+    sealed interface TimelineSseEvent {
+        data class Entry(val frame: TimelineEntryFrame) : TimelineSseEvent
+        data object Terminated : TimelineSseEvent
+    }
 
     /** GET /content/{content_id} — 按 id 取内容原始字节（要求 lease 已 attach 该会话）。 */
     fun content(clientSessionId: String, contentId: String): String =
@@ -177,6 +249,7 @@ class RingingApi(
     companion object {
         const val EVENT_RINGING = "ringing.event"
         const val EVENT_RESET = "ringing.reset_required"
+        const val EVENT_STREAM_TERMINATED = "ringing.stream_terminated"
         private const val EMPTY_JSON = "{}"
     }
 }

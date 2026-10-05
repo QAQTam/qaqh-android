@@ -23,8 +23,14 @@ class CredentialStore(context: Context) {
     private val json = Json { ignoreUnknownKeys = true }
 
     fun load(): StoredCredentials? {
-        val raw = prefs.getString(KEY_CREDENTIALS, null) ?: return null
-        return runCatching { json.decodeFromString(StoredCredentials.serializer(), raw) }.getOrNull()
+        val raw = prefs.getString(KEY_CREDENTIALS, null)
+        if (raw == null) {
+            android.util.Log.w("CredentialStore", "load: no stored credentials")
+            return null
+        }
+        return runCatching { json.decodeFromString(StoredCredentials.serializer(), raw) }
+            .onFailure { android.util.Log.w("CredentialStore", "load: decrypt/parse failed", it) }
+            .getOrNull()
     }
 
     fun save(credentials: StoredCredentials) {
