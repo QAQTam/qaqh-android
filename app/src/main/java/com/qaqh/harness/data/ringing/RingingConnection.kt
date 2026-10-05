@@ -41,8 +41,8 @@ import kotlin.math.min
 class RingingConnection(
     private val endpoint: String,
     private val token: String,
-    /** 目标会话 seed；null 时只建租约不订阅事件流。可经 [setSessionSeed] 动态切换。 */
-    private var sessionSeed: String?,
+    /** 目标session_id；null 时只建租约不订阅事件流。可经 [setSessionId] 动态切换。 */
+    private var sessionId: String?,
     private val scope: CoroutineScope,
     client: OkHttpClient? = null,
 ) {
@@ -96,11 +96,11 @@ class RingingConnection(
     }
 
     /** 切换目标会话（发现新活跃会话/用户选择时调用）：重置 cursor 并重启主循环。 */
-    fun setSessionSeed(seed: String?) {
+    fun setSessionId(newSessionId: String?) {
         scope.launch {
             mutex.withLock {
-                if (sessionSeed == seed) return@launch
-                sessionSeed = seed
+                if (sessionId == newSessionId) return@launch
+                sessionId = newSessionId
                 cursor = null
             }
             mainLoop?.cancelAndJoin()
@@ -143,7 +143,7 @@ class RingingConnection(
 
     private suspend fun postCommand(channel: String, command: kotlinx.serialization.json.JsonObject): CommandAck {
         val sid = mutex.withLock { clientSessionId } ?: error("not connected")
-        val seed = mutex.withLock { sessionSeed }
+        val sessionId = mutex.withLock { sessionId }
         return api.postCommand(
             sid,
             CommandEnvelope(
@@ -151,7 +151,7 @@ class RingingConnection(
                 commandId = UUID.randomUUID().toString(),
                 clientInstanceId = instanceId,
                 clientSessionId = sid,
-                sessionId = seed,
+                sessionId = sessionId,
                 command = command,
             ),
         )
@@ -211,18 +211,20 @@ class RingingConnection(
     }
 
     private suspend fun streamEvents() {
-        val seed = mutex.withLock { sessionSeed }
-        if (seed == null) {
+        val sessionId = mutex.withLock { sessionId }
+        if (sessionId == null) {
             awaitCancellation()
         }
         val sid = mutex.withLock { clientSessionId } ?: return
         if (mutex.withLock { cursor } == null) {
-            val boot = api.bootstrap(sid, seed)
+            val boot = api.bootstrap(sid, sessionId)
             mutex.withLock {
                 if (serverEpoch != boot.serverEpoch) cursor = null
                 serverEpoch = boot.serverEpoch
                 cursor = boot.snapshotCursor
             }
+            // attach 只读归属：/content 与后续 owns_session 校验的前提（M0 后成为硬要求）
+            runCatching { postCommand(RingingProtocol.CHANNEL_CONTROL, CommandEnvelope.sessionAttach(sessionId)) }
             // bootstrap 快照自带当前活动状态，先投影一次（后续靠 SSE activity 增量更新）
             boot.activity?.let { _events.tryEmit(SessionEvent.Activity(it, null)) }
             // 快照里已挂起的交互也要投影（重连/后加入的客户端靠它看到积压请求）
@@ -244,7 +246,7 @@ class RingingConnection(
                 }
         }
         val since = mutex.withLock { cursor }
-        api.events(sid, seed, since).collect { sse ->
+        api.events(sid, sessionId, since).collect { sse ->
             when (sse) {
                 is RingingApi.SseEvent.Reset -> {
                     mutex.withLock { cursor = sse.reset.snapshotCursor }

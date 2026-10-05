@@ -92,13 +92,13 @@ class RingingApi(
             .build()
     )
 
-    /** GET /sessions/{seed}/bootstrap，拿快照与起始 cursor。 */
-    fun bootstrap(clientSessionId: String, seed: String): Bootstrap =
-        execute(requestBuilder("/sessions/$seed/bootstrap", clientSessionId).get().build())
+    /** GET /sessions/{session_id}/bootstrap，拿快照与起始 cursor。 */
+    fun bootstrap(clientSessionId: String, sessionId: String): Bootstrap =
+        execute(requestBuilder("/sessions/$sessionId/bootstrap", clientSessionId).get().build())
 
-    /** GET /sessions/{seed}/approvals，当前待审批快照。 */
-    fun approvals(clientSessionId: String, seed: String): Approvals =
-        execute(requestBuilder("/sessions/$seed/approvals", clientSessionId).get().build())
+    /** GET /sessions/{session_id}/approvals，当前待审批快照。 */
+    fun approvals(clientSessionId: String, sessionId: String): Approvals =
+        execute(requestBuilder("/sessions/$sessionId/approvals", clientSessionId).get().build())
 
     /** POST /commands/{channel}，提交命令信封，返回回执（回执 status 也可能是 rejected）。 */
     fun postCommand(clientSessionId: String, envelope: CommandEnvelope): CommandAck = execute(
@@ -107,6 +107,14 @@ class RingingApi(
             .build()
     )
 
+    /** GET /content/{content_id} — 按 id 取内容原始字节（要求 lease 已 attach 该会话）。 */
+    fun content(clientSessionId: String, contentId: String): String =
+        http.newCall(requestBuilder("/content/$contentId", clientSessionId).get().build()).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw ApiException(resp.code, null, body.take(120))
+            body
+        }
+
     /** POST /service/session.list — 会话列表（单活跃流模式的发现来源）。 */
     fun sessionList(clientSessionId: String): List<SessionListEntry> = execute(
         requestBuilder("/service/session.list", clientSessionId)
@@ -114,13 +122,13 @@ class RingingApi(
             .build()
     )
 
-    /** GET /sessions/{seed}/events 的 SSE 流。emit 事件信封与重置信号；从不完成（除非上游关闭）。 */
+    /** GET /sessions/{session_id}/events 的 SSE 流。emit 事件信封与重置信号；从不完成（除非上游关闭）。 */
     fun events(
         clientSessionId: String,
-        seed: String,
+        sessionId: String,
         sinceCursor: String?,
     ): Flow<SseEvent> = callbackFlow {
-        val url = (baseUrl + RingingProtocol.BASE_PATH + "/sessions/$seed/events").toHttpUrl()
+        val url = (baseUrl + RingingProtocol.BASE_PATH + "/sessions/$sessionId/events").toHttpUrl()
             .newBuilder()
             .apply { if (sinceCursor != null) addQueryParameter("since_cursor", sinceCursor) }
             .build()

@@ -39,7 +39,7 @@ data class PendingApproval(
  * 连接状态 / 会话活动 / 待审批三张全局 StateFlow，UI 层直接收集。
  *
  * 会话发现采用建议稿 §6 的"单活跃流 + 轮询"模式：每 15s 拉 `session.list`，
- * 取 running 会话（否则最近更新的一个），seed 变化时切换事件流。
+ * 取 running 会话（否则最近更新的一个），session_id 变化时切换事件流。
  * 审批请求到达时发高优先级通知（点进 MainActivity）。
  */
 class ConnectionService : Service() {
@@ -61,12 +61,12 @@ class ConnectionService : Service() {
         val conn = RingingConnection(
             endpoint = creds.baseUrl,
             token = creds.token,
-            sessionSeed = null, // 先建租约，发现会话后再 setSessionSeed
+            sessionId = null, // 先建租约，发现会话后再 setSessionId
             scope = scope,
         )
         connection = conn
         Companion.connection = conn
-        scope.launch { conn.events.collect { handleEvent(it) } }
+        scope.launch { conn.events.collect { handleEvent(it) } } // handleEvent 为 suspend，逐事件串行处理
         scope.launch {
             conn.state.collect { st ->
                 _connectionState.value = st
@@ -94,7 +94,7 @@ class ConnectionService : Service() {
         super.onDestroy()
     }
 
-    /** 每 15s 发现一次活跃会话；seed 变化时切换事件流。 */
+    /** 每 15s 发现一次活跃会话；session_id 变化时切换事件流。 */
     private suspend fun sessionDiscoveryLoop(conn: RingingConnection) {
         var currentSeed: String? = null
         while (scope.isActive) {
@@ -109,12 +109,12 @@ class ConnectionService : Service() {
             if (target.sessionId != currentSeed) {
                 currentSeed = target.sessionId
                 _sessionInfo.value = target
-                conn.setSessionSeed(target.sessionId)
+                conn.setSessionId(target.sessionId)
             }
         }
     }
 
-    private fun handleEvent(event: RingingConnection.SessionEvent) {
+    private suspend fun handleEvent(event: RingingConnection.SessionEvent) {
         when (event) {
             is RingingConnection.SessionEvent.Activity -> {
                 _activity.value = event.state
@@ -155,12 +155,27 @@ class ConnectionService : Service() {
         }
     }
 
-    private fun extractSummary(r: com.qaqh.harness.data.ringing.model.InteractionRequested): String {
-        // request 是 ContentValue {kind:"inline",data:{text:...}} 或 ref/unavailable；取人类可读文本
+    private suspend fun extractSummary(r: com.qaqh.harness.data.ringing.model.InteractionRequested): String {
+        // request 是 ContentValue {kind:"inline",data:{text:...}} 或 {kind:"ref",data:{content_ref:"sha256:..."}}
         val data = (r.request as? kotlinx.serialization.json.JsonObject)?.get("data")
             as? kotlinx.serialization.json.JsonObject
-        return (data?.get("text") as? kotlinx.serialization.json.JsonPrimitive)?.content
-            ?: r.callId ?: "工具调用请求"
+        (data?.get("text") as? kotlinx.serialization.json.JsonPrimitive)?.content?.let { return it }
+        // ref 型：拉原文（需已 attach）；原文可能是 {"text":...} JSON 或纯文本
+        val contentRef = (data?.get("content_ref") as? kotlinx.serialization.json.JsonPrimitive)?.content
+        if (contentRef != null) {
+            val sid = (_connectionState.value as? RingingConnection.State.Connected)?.clientSessionId
+            if (sid != null) {
+                val raw = runCatching { withTimeoutOrNull(5_000) { connection?.api?.content(sid, contentRef) } }.getOrNull()
+                if (!raw.isNullOrBlank()) {
+                    val parsed = runCatching {
+                        (connection?.api?.json?.parseToJsonElement(raw) as? kotlinx.serialization.json.JsonObject)
+                            ?.get("text") as? kotlinx.serialization.json.JsonPrimitive
+                    }.getOrNull()?.content
+                    return parsed ?: raw.take(300)
+                }
+            }
+        }
+        return r.callId ?: "工具调用请求"
     }
 
     // ---------- 通知 ----------

@@ -134,6 +134,13 @@ data class CommandEnvelope(
             put("autonomous", false)
         }
 
+        /** 构造 SessionAttach 命令体（control 通道，只读订阅归属；content/owns_session 校验的前提）。 */
+        fun sessionAttach(sessionId: String): JsonObject = buildJsonObject {
+            put("channel", RingingProtocol.CHANNEL_CONTROL)
+            put("type", "session_attach")
+            put("session_id", sessionId)
+        }
+
         /** 构造 InteractionAskDismiss 命令体（control 通道，关闭 ask_user 交互/中止挂起回合）。 */
         fun interactionAskDismiss(interactionId: String): JsonObject = buildJsonObject {
             put("channel", RingingProtocol.CHANNEL_CONTROL)
@@ -265,7 +272,7 @@ data class SessionListEntry(
 
 // ---------- approvals ----------
 
-/** GET /ringing/v2/sessions/{seed}/approvals 的返回体。 */
+/** GET /ringing/v2/sessions/{session_id}/approvals 的返回体。 */
 @Serializable
 data class Approvals(
     @SerialName("pending_permission") val pendingPermission: PendingPermission? = null,

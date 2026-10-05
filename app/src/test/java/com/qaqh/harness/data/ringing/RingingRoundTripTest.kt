@@ -38,7 +38,7 @@ class RingingRoundTripTest {
     private lateinit var api: RingingApi
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private val seed = "sess-1"
+    private val sessionId = "sess-1"
 
     private val sseFrame = buildString {
         append("id: v2:epoch-1:evt-1\n")
@@ -88,20 +88,20 @@ class RingingRoundTripTest {
 
                     path.endsWith("/leases/renew") -> json("""{"ok":true,"lease_ttl_ms":30000,"renew_interval_ms":10000}""")
 
-                    path == "/ringing/v2/sessions/$seed/bootstrap" -> {
+                    path == "/ringing/v2/sessions/$sessionId/bootstrap" -> {
                         assertEquals("cs-1", request.headers?.get("X-QAQH-Client-Session-Id"))
                         json(
-                            """{"schema":"qaqh.Ringing","version":2,"server_epoch":"epoch-1","session_id":"$seed",
+                            """{"schema":"qaqh.Ringing","version":2,"server_epoch":"epoch-1","session_id":"$sessionId",
                                 "snapshot_cursor":"v2.SNAP",
                                 "control":{"channel":"control","state_revision":3,"snapshot_version":1,
-                                           "state":{"session_id":"$seed","activity":"running","revision":3,
+                                           "state":{"session_id":"$sessionId","activity":"running","revision":3,
                                                     "last_fact_seq":3,"tools":[],"subagents":[],"interactions":[]}},
                                 "conversation":{"channel":"conversation","state_revision":0,"snapshot_version":1,"state":{}},
                                 "tool":{"channel":"tool","state_revision":0,"snapshot_version":1,"state":{"tools":[]}}}"""
                         )
                     }
 
-                    path == "/ringing/v2/sessions/$seed/events" -> {
+                    path == "/ringing/v2/sessions/$sessionId/events" -> {
                         assertEquals("v2.SNAP", request.url?.queryParameter("since_cursor"))
                         MockResponse.Builder()
                             .code(200)
@@ -133,13 +133,13 @@ class RingingRoundTripTest {
 
         assertTrue(api.renew("cs-1").ok)
 
-        val boot = api.bootstrap("cs-1", seed)
+        val boot = api.bootstrap("cs-1", sessionId)
         assertEquals("v2.SNAP", boot.snapshotCursor)
         assertEquals("running", boot.activity)
 
         // SSE：应收到 interaction_requested(permission) 事件
         val got = ArrayList<RingingApi.SseEvent>()
-        val collector = scope.launch { api.events("cs-1", seed, boot.snapshotCursor).collect { got.add(it) } }
+        val collector = scope.launch { api.events("cs-1", sessionId, boot.snapshotCursor).collect { got.add(it) } }
         val first = withTimeout(10_000) {
             while (got.isEmpty()) delay(50)
             got.first()
@@ -161,7 +161,7 @@ class RingingRoundTripTest {
                 commandId = "cmd-1",
                 clientInstanceId = "instance-1",
                 clientSessionId = "cs-1",
-                sessionId = seed,
+                sessionId = sessionId,
                 command = CommandEnvelope.toolPermissionRespond("call_1", approved = true),
             ),
         )
@@ -194,7 +194,7 @@ class RingingRoundTripTest {
         )
         api = RingingApi(server.url("/").toString(), "test-token")
         val reset = withTimeout(10_000) {
-            api.events("cs-1", seed, "v2.OLD").filterIsInstance<RingingApi.SseEvent.Reset>().first()
+            api.events("cs-1", sessionId, "v2.OLD").filterIsInstance<RingingApi.SseEvent.Reset>().first()
         }
         assertEquals("cursor_expired", reset.reset.reason)
     }
