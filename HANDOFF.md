@@ -19,6 +19,16 @@
 - ⚠️ `gradle/wrapper/gradle-wrapper.properties` 的 `distributionUrl` 指向本地 `tmp/gradle-9.8.0-bin.zip`（Java 不走系统代理，远程下载失败过）。`tmp/` 已 gitignore，勿删该 zip，或改回官方 URL 并配好代理。
 - 真机调试：adb 在 `.tools/android-sdk/platform-tools/`；测试机已无线配对（Android 16 / SDK 36，OPPO）。`adb install -r app/build/outputs/apk/debug/app-debug.apk` 装包，logcat 持续抓取写到 `tmp/logcat-session.log`。
 
+## 真机调试经验（2026-10-05 晚，重要）
+
+- **daemon 重启 = token 轮换**：手动 `qaqh server` 起的实例每次重启 token 都变，手机必须重新配对（device_token 落地前无解）。18:13 的"没反应"就是这个。
+- **两个 daemon 实例的坑**：TUI 宿主的 daemon 和手动起的 daemon 是两个实例、不同数据根——会话列表空不一定是 app 的 bug，先确认连的是哪个实例（`~/.qaqh/.qaqh-data-root.json`）。
+- **SSE 被读超时掐断**：OkHttp 默认 readTimeout 10s，timeline/events 空闲即断——已用专用 client（readTimeout=0）修复；SSE 重放会重复投递，reducer 必须 merge/dedupe（block 按 block_id、turn 按 turn_id 合并）。
+- **timeline 帧结构**：`event: timeline.entry` 的 data 里 TimelineEntry 嵌在 `entry` 键下，别按顶层解析。
+- **会话 id 不一定是完整 UUID**（如 `01a10b72-1222-75`）；`session.list` 里有 `.tmp*` 内部会话（bootstrap 404），已过滤。
+- **凭据丢失 2 次**：EncryptedSharedPreferences 读回为空（"no stored credentials"），怀疑 allowBackup 自动恢复弄坏加密 prefs——已关 allowBackup，观察是否复发。
+- **adb 无线调试端口会变**：锁屏后掉线，重连用 `adb mdns services` 取新端口；手机截屏是 1240x2772，adb 点击坐标按真实分辨率换算。
+
 ## 真机验证记录（2026-10-05）
 
 - ✅ 扫码/手输配对 → 前台服务连接 → `session.list` 会话发现 → Home 卡片（模型/轮次/running）→ bootstrap 活动投影（空闲徽标）→ 挂起交互快照投影（重启不丢）。
