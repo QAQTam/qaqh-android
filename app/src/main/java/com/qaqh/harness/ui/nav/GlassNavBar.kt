@@ -107,6 +107,11 @@ fun GlassNavBar(
 ) {
     val view = LocalView.current
     val scope = rememberCoroutineScope()
+    // 手势 lambda 的 key 不含 selected/onSelect（否则每次选中变化都重启手势），
+    // 闭包里拿到的是首组合的旧值——必须经 rememberUpdatedState 取最新
+    // （否则 selected 变化后点回旧值 tab 会被 `tapped != selected` 误吞）
+    val currentSelected by androidx.compose.runtime.rememberUpdatedState(selected)
+    val currentOnSelect by androidx.compose.runtime.rememberUpdatedState(onSelect)
     // 透镜进度：单位 = tab 格数（0..lastIndex）的 Animatable——拖拽 snapTo 跟手、
     // 松手 animateTo 弹簧收敛（初速度 = 拖动初速度换算成格/秒）
     val lensProgress = remember { Animatable(selected.toFloat()) }
@@ -199,7 +204,7 @@ fun GlassNavBar(
                                     val idx = gestureUnits.roundToInt().coerceIn(0, lastIdx)
                                     previewIndex = idx
                                     view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
-                                    onSelect(idx)
+                                    currentOnSelect(idx)
                                     scope.launch { stretch.animateTo(0f, spring(stiffness = Spring.StiffnessMedium)) }
                                     scope.launch {
                                         lensProgress.animateTo(
@@ -211,9 +216,9 @@ fun GlassNavBar(
                                 } else {
                                     // 轻点：down 落在哪个 tab 就切哪个
                                     val tapped = (downX / itemPx).toInt().coerceIn(0, lastIdx)
-                                    if (tapped != selected) {
+                                    if (tapped != currentSelected) {
                                         view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                                        onSelect(tapped)
+                                        currentOnSelect(tapped)
                                     }
                                 }
                                 break
