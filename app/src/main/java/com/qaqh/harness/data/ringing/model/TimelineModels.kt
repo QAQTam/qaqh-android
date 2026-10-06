@@ -3,6 +3,7 @@ package com.qaqh.harness.data.ringing.model
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 
 /**
  * Timeline API（`GET /sessions/{session_id}/timeline`）wire 模型，
@@ -60,8 +61,38 @@ data class TimelineTool(
     @SerialName("args_json") val argsJson: String? = null,
     val output: String? = null,
     @SerialName("exit_code") val exitCode: Int? = null,
-    @SerialName("completed_at_ms") val completedAtMs: Long? = null,
+    val diff: String? = null,
+    /** 运行中流式输出尾（ToolProgress 增量在此累积，本地截尾保后 8K；对齐 TUI MAX_PROGRESS_LEN）。 */
+    val progress: String = "",
+    @SerialName("progress_truncated") val progressTruncated: Boolean = false,
+    /**
+     * 类型化展示投影（对齐 TUI adapter）：header/body 是 raw JSON（tag="kind" 的枚举），
+     * 展示层按 kind 解析；未知变体回退 legacy 字段（H16 原则，不丢整块）。
+     */
+    val display: ToolDisplay? = null,
+    val failure: ToolFailure? = null,
 )
+
+@Serializable
+data class ToolDisplay(
+    val summary: String? = null,
+    val diff: String? = null,
+    @SerialName("lines_added") val linesAdded: Int = 0,
+    @SerialName("lines_removed") val linesRemoved: Int = 0,
+    val header: JsonObject? = null,
+    val body: JsonObject? = null,
+    val metrics: ToolMetrics? = null,
+)
+
+@Serializable
+data class ToolMetrics(
+    @SerialName("elapsed_ms") val elapsedMs: Long? = null,
+    @SerialName("output_bytes") val outputBytes: Long? = null,
+    @SerialName("retry_count") val retryCount: Int? = null,
+)
+
+@Serializable
+data class ToolFailure(val code: String? = null, val message: String? = null)
 
 // ---------- timeline/events SSE ----------
 

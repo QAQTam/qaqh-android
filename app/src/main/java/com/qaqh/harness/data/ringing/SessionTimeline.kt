@@ -149,6 +149,9 @@ class SessionTimeline(
 
         /** 无帧判定为死流的阈值；服务端 15s keepalive 只保管道，帧级空闲超过它即重订阅。 */
         const val IDLE_TIMEOUT_MS = 60_000L
+
+        /** 工具进度缓冲上限（对齐 TUI MAX_PROGRESS_LEN），超出截头保尾。 */
+        const val MAX_PROGRESS_LEN = 8_192
     }
 
     fun stop() {
@@ -327,7 +330,15 @@ class SessionTimeline(
             "tool_progress" -> mutateBlock(frame, str("block_id") ?: return) { block ->
                 val chunk = str("chunk") ?: return@mutateBlock block
                 val tool = block.tool ?: TimelineTool()
-                block.copy(tool = tool.copy(output = (tool.output ?: "") + chunk))
+                // 对齐 TUI：进度增量进 progress（8K 截尾保尾部，输出结论在最后），不污染 output
+                val merged = tool.progress + chunk
+                val over = merged.length - MAX_PROGRESS_LEN
+                block.copy(
+                    tool = tool.copy(
+                        progress = if (over > 0) merged.substring(over) else merged,
+                        progressTruncated = tool.progressTruncated || over > 0,
+                    )
+                )
             }
 
             "block_sealed" -> mutateBlock(frame, str("block_id") ?: return) { block ->

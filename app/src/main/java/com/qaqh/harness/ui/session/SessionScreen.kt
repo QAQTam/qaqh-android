@@ -37,7 +37,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -101,13 +100,19 @@ fun SessionScreen(
         onDispose { timeline.stop() }
     }
 
-    // ---- 自动追底：只在用户贴底时跟随，上翻历史不被打断 ----
+    // ---- 自动追底：交互驱动的跟随开关 ----
+    // followBottom 只被两种事件改写：用户拖动（离开）/ 拖回底部或自己发消息（恢复）。
+    // 不用 layoutInfo 推断"是否贴底"——contentPadding/长 item 残余偏移会让判定抖动失效。
     val listState = rememberLazyListState()
-    val atBottom by remember {
-        derivedStateOf {
-            val info = listState.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull() ?: return@derivedStateOf true
-            last.index >= info.totalItemsCount - 1 && last.offset + last.size <= info.viewportEndOffset + 16
+    var followBottom by remember { mutableStateOf(true) }
+    LaunchedEffect(listState) {
+        listState.interactionSource.interactions.collect { interaction ->
+            when (interaction) {
+                is androidx.compose.foundation.interaction.DragInteraction.Start -> followBottom = false
+                is androidx.compose.foundation.interaction.DragInteraction.Stop,
+                is androidx.compose.foundation.interaction.DragInteraction.Cancel,
+                -> if (!listState.canScrollForward) followBottom = true
+            }
         }
     }
     var didInitialJump by remember { mutableStateOf(false) }
@@ -118,18 +123,21 @@ fun SessionScreen(
             pinToBottom(listState)
         }
     }
-    // 新回合出现（自己发消息/新回复回合）：贴底才跟随
+    // 新回合出现：自己发的消息（带用户文本）无条件回底；其余新内容跟随开关打开才追
     LaunchedEffect(turns.size) {
-        if (didInitialJump && turns.isNotEmpty() && atBottom) pinToBottom(listState)
+        if (!didInitialJump) return@LaunchedEffect
+        val lastTurn = turns.lastOrNull() ?: return@LaunchedEffect
+        if (lastTurn.userText != null) followBottom = true
+        if (followBottom) pinToBottom(listState)
     }
-    // 流式文本增长：贴底时把底边钉在视口底（无动画，动画追不上生成速度）。
+    // 流式文本增长：跟随打开时把底边钉在视口底（无动画）。
     // 80ms 节流：每条 delta 都滚动会强制长 item 反复 measure/layout（JankStats 实测
     // 32-57ms 的 jank 与此相关）；80ms 内多次 delta 合并成一次滚动，残余偏移不足一行。
     var lastFollowMs by remember { mutableLongStateOf(0L) }
     val lastBlockSignature = turns.lastOrNull()?.rounds?.lastOrNull()?.blocks
         ?.joinToString("/") { "${it.blockId}:${it.text?.length ?: 0}" }
     LaunchedEffect(lastBlockSignature) {
-        if (didInitialJump && atBottom) {
+        if (didInitialJump && followBottom) {
             val now = android.os.SystemClock.uptimeMillis()
             if (now - lastFollowMs >= 80) {
                 lastFollowMs = now
@@ -243,16 +251,13 @@ fun SessionScreen(
 
 // ---------- 消息渲染 ----------
 
-/** 把最后一项的底边钉在视口底：先滚到该项顶部，再补滚其超出视口的高度（流式 item 会持续长高）。 */
+/** 把最后一项的底边钉在视口底：滚到最后一项后正向滚一个大量程——LazyList 会在真正底边 clamp，
+ *  天然处理"item 高于视口"与 contentPadding 残余偏移。 */
 private suspend fun pinToBottom(listState: androidx.compose.foundation.lazy.LazyListState) {
     runCatching {
         val last = listState.layoutInfo.totalItemsCount - 1
-        if (last < 0) return
-        listState.scrollToItem(last)
-        val info = listState.layoutInfo
-        val item = info.visibleItemsInfo.lastOrNull() ?: return
-        val overflow = (item.offset + item.size) - info.viewportEndOffset
-        if (overflow > 0) listState.scrollBy(overflow.toFloat())
+        if (last >= 0) listState.scrollToItem(last)
+        listState.scrollBy(10_000f)
     }
 }
 
@@ -365,72 +370,132 @@ private fun ReasoningItem(block: TimelineBlock) {
     }
 }
 
-/** 工具调用卡片：状态点（运行中转圈）+ 名称 + 摘要；点击展开参数/输出（mono、可复制）。 */
+/**
+ * 工具调用卡片（数据清洗对齐 TUI）：标题 = 动词 + typed header 正文（单行裁剪），
+ * 折叠态预览输出尾部 3 行（mono），展开看全文/原始参数；失败头部带 exit code，理由只在正文。
+ */
 @Composable
 private fun ToolCard(tool: TimelineTool) {
     var expanded by remember(tool.toolCallId) { mutableStateOf(false) }
-    val (color, stateLabel) = toolPresentation(tool.state)
+    var showRawArgs by remember(tool.toolCallId) { mutableStateOf(false) }
     val running = tool.state == "running" || tool.state == "prepared"
+    val head = remember(tool) { ToolFormatter.header(tool) }
+    val dotColor = when {
+        head.failed -> MaterialTheme.colorScheme.error
+        tool.state == "succeeded" -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.outline
+    }
+    val stateText = when (tool.state) {
+        "succeeded" -> "完成"
+        "failed" -> "失败"
+        "cancelled" -> "已取消"
+        "backgrounded" -> "后台"
+        else -> tool.state ?: ""
+    }
+    val body = remember(tool) { ToolFormatter.body(tool) }
+    val preview = remember(body) { body?.let { ToolFormatter.previewTail(it) } }
+    val elapsed = remember(tool) { ToolFormatter.elapsedLabel(tool) }
     val clipboard = LocalContext.current.getSystemService(android.content.ClipboardManager::class.java)
+
     Card(modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }) {
         Column(Modifier.padding(CardInnerPadding), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            // 头部：状态 + 动词 + 单行正文 + 时长/状态
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(BlockSpacing)) {
                 if (running) {
                     CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 2.dp)
                 } else {
-                    Box(Modifier.size(8.dp).clip(CircleShape).background(color))
+                    Box(Modifier.size(8.dp).clip(CircleShape).background(dotColor))
                 }
-                Text(tool.name ?: "tool", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
                 Text(
-                    stateLabel,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (tool.state == "failed") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    buildString {
+                        append(head.verb)
+                        head.rest?.takeIf { it.isNotBlank() }?.let { append(' '); append(it) }
+                        if (head.failed && head.exitCode != null && head.exitCode != 0) append(" (exit ${head.exitCode})")
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
                 )
-            }
-            tool.summary?.takeIf { it.isNotBlank() }?.let {
-                Text(it, style = MaterialTheme.typography.bodySmall, maxLines = if (expanded) Int.MAX_VALUE else 2, overflow = TextOverflow.Ellipsis)
-            }
-            if (expanded) {
-                tool.argsJson?.takeIf { it.isNotBlank() }?.let {
+                elapsed?.let {
+                    Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (!running) {
                     Text(
-                        "参数：$it",
+                        stateText,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (head.failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            // 折叠预览：输出尾部 3 行；展开：全文
+            if (expanded) {
+                body?.let { text ->
+                    Text(
+                        text,
                         style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+                        maxLines = 200,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                            .padding(8.dp),
+                    )
+                    TextButton(onClick = {
+                        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("output", text))
+                    }) { Text("复制输出") }
+                }
+                tool.failure?.message?.takeIf { it.isNotBlank() }?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+                // 原始参数默认隐藏（对齐 TUI：args_json 永不进标题，按需查看）
+                TextButton(onClick = { showRawArgs = !showRawArgs }) {
+                    Text(if (showRawArgs) "隐藏原始参数" else "原始参数", style = MaterialTheme.typography.labelSmall)
+                }
+                if (showRawArgs) {
+                    tool.argsJson?.takeIf { it.isNotBlank() }?.let {
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 40,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                tool.progressTruncated.takeIf { it }?.let {
+                    Text("… 输出已截断", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            } else if (preview != null) {
+                val (lines, hidden) = preview
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(1.dp),
+                ) {
+                    lines.forEach { line ->
+                        Text(
+                            line,
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                if (hidden > 0) {
+                    Text(
+                        "… +$hidden 行（点击展开）",
+                        style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                tool.output?.takeIf { it.isNotBlank() }?.let { output ->
-                    Row(verticalAlignment = Alignment.Top) {
-                        Text(
-                            output,
-                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
-                            maxLines = 20,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(MaterialTheme.colorScheme.surfaceVariant)
-                                .padding(8.dp),
-                        )
-                        TextButton(onClick = {
-                            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("output", output))
-                        }) { Text("复制") }
-                    }
-                }
-                tool.exitCode?.let { Text("exit code: $it", style = MaterialTheme.typography.labelSmall) }
             }
         }
     }
-}
-
-private data class ToolPresentation(val color: androidx.compose.ui.graphics.Color, val label: String)
-
-@Composable
-private fun toolPresentation(state: String?): ToolPresentation = when (state) {
-    "succeeded" -> ToolPresentation(MaterialTheme.colorScheme.primary, "完成")
-    "failed" -> ToolPresentation(MaterialTheme.colorScheme.error, "失败")
-    "cancelled" -> ToolPresentation(MaterialTheme.colorScheme.outline, "已取消")
-    "running", "prepared" -> ToolPresentation(MaterialTheme.colorScheme.tertiary, "运行中")
-    else -> ToolPresentation(MaterialTheme.colorScheme.outline, state ?: "-")
 }
 
 // ---------- 审批卡片（permission / ask / plan） ----------
