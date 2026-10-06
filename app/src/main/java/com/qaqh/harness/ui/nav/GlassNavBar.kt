@@ -1,3 +1,5 @@
+@file:OptIn(dev.chrisbanes.haze.ExperimentalHazeApi::class)
+
 package com.qaqh.harness.ui.nav
 
 import androidx.compose.animation.animateColorAsState
@@ -36,9 +38,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import dev.chrisbanes.haze.HazeInput
 import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.blur.HazeBlurStyle
-import dev.chrisbanes.haze.blur.hazeBlur
-import dev.chrisbanes.haze.blur.material3.Material3
+import dev.chrisbanes.haze.glass.GlassStyle
+import dev.chrisbanes.haze.glass.hazeGlass
+import dev.chrisbanes.haze.glass.material3.Material3
 
 // ---- 玻璃导航栏几何常量 ----
 private val BarHeight = 64.dp
@@ -82,12 +84,14 @@ fun GlassNavBar(
                 .zIndex(1f)
                 .shadow(18.dp, CircleShape, ambientColor = Color.Black.copy(alpha = 0.25f))
                 .clip(CircleShape)
-                .hazeBlur(
+                // 液态玻璃：GPU shader 折射 + 镜面高光（haze-glass，SDK 31+ 走 RenderEffect，
+                // 低配/不支持时库内部自动降级为近似填充）
+                .hazeGlass(
                     input = HazeInput.Sources(hazeState),
-                    // backgroundColor 半透明即 tint：磨砂 + 保留内容色彩流动感
-                    style = HazeBlurStyle.Material3(containerColor = surface) {
-                        blurRadius(18.dp)
-                        backgroundColor(surface.copy(alpha = 0.55f))
+                    style = GlassStyle.Material3(containerColor = surface) {
+                        shape(androidx.compose.foundation.shape.CircleShape)
+                        // 白色薄 tint 提亮，接近 iOS 27 悬浮条的通透感
+                        tint(Color.White.copy(alpha = 0.14f))
                     },
                 )
                 .border(

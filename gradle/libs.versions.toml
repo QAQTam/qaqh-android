@@ -49,6 +49,8 @@ markdown-renderer-m3 = { group = "com.mikepenz", name = "multiplatform-markdown-
 haze = { group = "dev.chrisbanes.haze", name = "haze", version.ref = "haze" }
 haze-blur = { group = "dev.chrisbanes.haze", name = "haze-blur", version.ref = "haze" }
 haze-blur-material3 = { group = "dev.chrisbanes.haze", name = "haze-blur-material3", version.ref = "haze" }
+haze-glass = { group = "dev.chrisbanes.haze", name = "haze-glass", version.ref = "haze" }
+haze-glass-material3 = { group = "dev.chrisbanes.haze", name = "haze-glass-material3", version.ref = "haze" }
 androidx-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
 
 [plugins]
