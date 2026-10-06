@@ -1,9 +1,9 @@
-@file:OptIn(dev.chrisbanes.haze.ExperimentalHazeApi::class)
+@file:OptIn(dev.chrisbanes.haze.ExperimentalHazeApi::class, androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 
 package com.qaqh.harness.ui.nav
 
-import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -11,6 +11,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -45,8 +46,7 @@ import dev.chrisbanes.haze.glass.material3.Material3
 // ---- 玻璃导航栏几何常量 ----
 private val BarHeight = 64.dp
 private val BarHorizontalMargin = 28.dp
-private val ItemCorner = 28.dp
-private val IndicatorCorner = 24.dp
+private val LensCorner = 26.dp
 private val ContentBottomClearance = 104.dp // 列表内容为悬浮条预留的底部净空
 
 /** 悬浮条要遮挡的底部 inset + 自身高度 + 间距。 */
@@ -61,9 +61,9 @@ data class GlassNavItem(
 )
 
 /**
- * iOS 27 风格悬浮磨砂玻璃导航条（与鸿蒙端对齐的视觉基调）：
- * 居中悬浮胶囊 + 背景实时模糊（hazeBlur 采样列表滚动内容）+ 顶部高光描边 +
- * 选中项独立玻璃药丸指示器（spring 滑动）。列表内容从条下滚过。
+ * iOS 27 风格悬浮液态玻璃导航条（与鸿蒙端对齐）：
+ * 条身 = 低 tint 玻璃（列表内容透过来，边缘折射）；选中项 = 独立玻璃透镜，
+ * spring 滑动切换（真机折射光效集中在透镜上，即参考图的形态）。
  */
 @Composable
 fun GlassNavBar(
@@ -75,7 +75,7 @@ fun GlassNavBar(
 ) {
     Box(modifier.fillMaxWidth(), contentAlignment = Alignment.BottomCenter) {
         val surface = MaterialTheme.colorScheme.surface
-        Row(
+        BoxWithConstraints(
             Modifier
                 .padding(horizontal = BarHorizontalMargin)
                 .fillMaxWidth()
@@ -84,14 +84,12 @@ fun GlassNavBar(
                 .zIndex(1f)
                 .shadow(18.dp, CircleShape, ambientColor = Color.Black.copy(alpha = 0.25f))
                 .clip(CircleShape)
-                // 液态玻璃：GPU shader 折射 + 镜面高光（haze-glass，SDK 31+ 走 RenderEffect，
-                // 低配/不支持时库内部自动降级为近似填充）
+                // 条身：低不透明度（backgroundColor 只留薄纱），折射与模糊透出内容
                 .hazeGlass(
                     input = HazeInput.Sources(hazeState),
-                    style = GlassStyle.Material3(containerColor = surface) {
-                        shape(androidx.compose.foundation.shape.CircleShape)
-                        // 白色薄 tint 提亮，接近 iOS 27 悬浮条的通透感
-                        tint(Color.White.copy(alpha = 0.14f))
+                    style = GlassStyle.Material3(containerColor = surface.copy(alpha = 0.28f)) {
+                        shape(CircleShape)
+                        tint(Color.White.copy(alpha = 0.08f))
                     },
                 )
                 .border(
@@ -104,16 +102,52 @@ fun GlassNavBar(
                     ),
                     shape = CircleShape,
                 ),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            items.forEachIndexed { index, item ->
-                NavItem(
-                    item = item,
-                    selected = index == selected,
-                    modifier = Modifier.weight(1f),
-                    onClick = { onSelect(index) },
-                )
+            val itemWidth = maxWidth / items.size
+            // 选中透镜：滑动的独立玻璃药丸（比条身更"厚"——更高 tint + 阴影浮起）
+            val lensX by animateDpAsState(
+                targetValue = itemWidth * selected,
+                animationSpec = spring(
+                    dampingRatio = Spring.DampingRatioLowBouncy,
+                    stiffness = Spring.StiffnessMediumLow,
+                ),
+                label = "lensSlide",
+            )
+            val lensShape = RoundedCornerShape(LensCorner)
+            Box(
+                Modifier
+                    .offset(x = lensX)
+                    .size(width = itemWidth, height = BarHeight)
+                    .padding(horizontal = 3.dp, vertical = 4.dp)
+                    .shadow(10.dp, lensShape, ambientColor = Color.Black.copy(alpha = 0.30f))
+                    .clip(lensShape)
+                    .hazeGlass(
+                        input = HazeInput.Sources(hazeState),
+                        style = GlassStyle.Material3(containerColor = surface.copy(alpha = 0.45f)) {
+                            shape(lensShape)
+                            tint(Color.White.copy(alpha = 0.20f))
+                        },
+                    )
+                    .border(
+                        width = 1.dp,
+                        brush = Brush.verticalGradient(
+                            colors = listOf(
+                                Color.White.copy(alpha = 0.70f),
+                                Color.White.copy(alpha = 0.15f),
+                            ),
+                        ),
+                        shape = lensShape,
+                    ),
+            )
+            Row(Modifier.fillMaxSize()) {
+                items.forEachIndexed { index, item ->
+                    NavItem(
+                        item = item,
+                        selected = index == selected,
+                        modifier = Modifier.weight(1f),
+                        onClick = { onSelect(index) },
+                    )
+                }
             }
         }
     }
@@ -126,33 +160,19 @@ private fun NavItem(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val indicator by animateColorAsState(
-        targetValue = if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
-        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
-        label = "navIndicator",
-    )
     val tint = if (selected) {
         MaterialTheme.colorScheme.onSecondaryContainer
     } else {
         MaterialTheme.colorScheme.onSurfaceVariant
     }
-    Box(
-        modifier
-            .padding(horizontal = 4.dp, vertical = 6.dp)
-            .clip(RoundedCornerShape(IndicatorCorner))
-            .background(indicator)
-            .padding(vertical = 6.dp)
-            // 点击区域含指示器外圈，视觉上只有药丸变色
-            ,
-        contentAlignment = Alignment.Center,
-    ) {
+    Box(modifier.padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(1.dp),
             modifier = Modifier
-                .clip(RoundedCornerShape(ItemCorner))
+                .clip(RoundedCornerShape(LensCorner))
                 .clickableNoRipple(onClick)
-                .padding(horizontal = 12.dp, vertical = 2.dp),
+                .padding(horizontal = 12.dp, vertical = 4.dp),
         ) {
             Box {
                 Icon(
