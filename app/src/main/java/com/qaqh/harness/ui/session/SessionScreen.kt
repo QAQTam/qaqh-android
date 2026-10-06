@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+
 package com.qaqh.harness.ui.session
 
 import androidx.compose.foundation.background
@@ -8,6 +10,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -27,12 +30,18 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -286,6 +295,14 @@ private fun DebugRecomposeCounter(tag: String) {
 private fun TurnItem(turn: TimelineTurn) {
     // debug 质量探针：未变化的 turn 不应重组（计数持续为 0 即"没有整棵树重渲染"的证据）
     if (com.qaqh.harness.BuildConfig.DEBUG) DebugRecomposeCounter("turn=${turn.turnId.take(8)}")
+    val blocks = remember(turn) { turn.rounds.flatMap { it.blocks } }
+    // 过程块（思考+工具）vs 内容块（正文/通知）——Qoder 式折叠的对象
+    val processBlocks = blocks.filter { it.kind == "reasoning" || (it.kind == "tool" && it.tool != null) }
+    val runningTool = processBlocks.lastOrNull {
+        it.kind == "tool" && (it.tool?.state == "running" || it.tool?.state == "prepared")
+    }
+    val openReasoning = processBlocks.lastOrNull { it.kind == "reasoning" && it.state == "open" }
+
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         turn.userText?.takeIf { it.isNotBlank() }?.let { userText ->
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
@@ -299,11 +316,171 @@ private fun TurnItem(turn: TimelineTurn) {
                 )
             }
         }
-        turn.rounds.forEach { round ->
-            round.blocks.forEach { block -> BlockItem(block) }
+
+        if (turn.sealed) {
+            // 回合完成：过程整体收成一行（Qoder assistantProcessFolding），流里只剩正文
+            if (processBlocks.isNotEmpty()) {
+                val show = remember { mutableStateOf(false) }
+                ProcessChip(
+                    label = "查看执行过程",
+                    subtitle = processSummary(processBlocks),
+                    stepCount = processBlocks.size,
+                    onClick = { show.value = true },
+                )
+                if (show.value) {
+                    ProcessSheet(processBlocks) { show.value = false }
+                }
+            }
+        } else {
+            // 回合进行中：已完成过程（工具+已收束思考）聚合一行 + 当前思考卡 + 运行中工具单行
+            val doneProcess = processBlocks.filter { it != runningTool && it != openReasoning }
+            if (doneProcess.isNotEmpty()) {
+                val show = remember { mutableStateOf(false) }
+                ProcessChip(
+                    label = "已运行工具",
+                    subtitle = processSummary(doneProcess),
+                    stepCount = doneProcess.size,
+                    failed = doneProcess.any { it.tool?.state == "failed" },
+                    onClick = { show.value = true },
+                )
+                if (show.value) {
+                    ProcessSheet(doneProcess) { show.value = false }
+                }
+            }
+            openReasoning?.let { ReasoningItem(it) }
+            runningTool?.let { RunningToolChip(it) }
+        }
+
+        blocks.forEach { block ->
+            if (block.kind == "text" || block.kind == "notice") BlockItem(block)
         }
         if (turn.state == "running") {
             Text("…", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 4.dp))
+        }
+    }
+}
+
+/** 过程聚合副标题：按家族分类计数（Qoder 分类摘要的简化版），如"编辑 2 · 运行 5 · 思考 1"。 */
+private fun processSummary(blocks: List<TimelineBlock>): String? {
+    val counts = LinkedHashMap<String, Int>()
+    var failed = 0
+    blocks.forEach { b ->
+        val tool = b.tool
+        if (tool == null) {
+            counts["思考"] = (counts["思考"] ?: 0) + 1
+            return@forEach
+        }
+        if (tool.state == "failed") failed++
+        val family = toolFamilyLabel(tool.name)
+        counts[family] = (counts[family] ?: 0) + 1
+    }
+    if (counts.isEmpty()) return null
+    val parts = counts.entries.joinToString(" · ") { "${it.key} ${it.value}" }
+    return if (failed > 0) "$parts · 失败 $failed" else parts
+}
+
+private fun toolFamilyLabel(name: String?): String = when (name?.lowercase()) {
+    "exec", "shell", "bash", "run" -> "运行"
+    "read" -> "读取"
+    "grep", "search" -> "搜索"
+    "glob", "ls", "find" -> "查找"
+    "write" -> "写入"
+    "edit", "apply_patch" -> "编辑"
+    "todo_write", "todo_update", "todo_list" -> "计划"
+    else -> "工具"
+}
+
+/** 过程聚合芯片：一行高度，图标 + 标签 + 步数 + 分类副标题（Qoder 折叠+计数方案）。 */
+@Composable
+private fun ProcessChip(
+    label: String,
+    subtitle: String?,
+    stepCount: Int,
+    failed: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(BlockSpacing),
+        ) {
+            Icon(
+                Icons.Filled.Build,
+                contentDescription = null,
+                tint = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(14.dp),
+            )
+            Text(
+                label,
+                style = MaterialTheme.typography.labelLarge,
+                color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+            )
+            Text(
+                "· $stepCount 步",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (subtitle != null) {
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+            } else {
+                Spacer(Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+/** 运行中工具单行芯片：转圈 + 动词头部，无正文。 */
+@Composable
+private fun RunningToolChip(block: TimelineBlock) {
+    val tool = block.tool ?: return
+    val head = remember(tool) { ToolFormatter.header(tool) }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(BlockSpacing),
+    ) {
+        CircularProgressIndicator(Modifier.size(10.dp), strokeWidth = 1.5.dp)
+        Text(
+            buildString {
+                append(head.verb)
+                head.rest?.takeIf { it.isNotBlank() }?.let { append(' '); append(it) }
+            },
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+/** 执行过程详情：底部弹层，完整工具卡/思考卡列表（细节不占聊天流）。 */
+@Composable
+private fun ProcessSheet(blocks: List<TimelineBlock>, onDismiss: () -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        LazyColumn(
+            contentPadding = PaddingValues(horizontal = ScreenPadding, vertical = BlockSpacing),
+            verticalArrangement = Arrangement.spacedBy(BlockSpacing),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            items(blocks, key = { it.blockId }) { block ->
+                if (block.kind == "reasoning") ReasoningItem(block) else block.tool?.let { ToolCard(it) }
+            }
         }
     }
 }
@@ -313,11 +490,17 @@ private fun BlockItem(block: TimelineBlock) {
     when (block.kind) {
         "reasoning" -> ReasoningItem(block)
         "text" -> if (!block.text.isNullOrBlank()) {
-            Text(
-                block.text,
-                style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-            )
+            if (block.state == "sealed") {
+                // 定稿：Markdown 渲染（参数不变时 Compose 跳过重组合，解析只在块定稿时发生一次）
+                com.mikepenz.markdown.m3.Markdown(block.text)
+            } else {
+                // 流式中：纯文本（每帧重解析 Markdown 是唯一的卡顿做法，避开）
+                Text(
+                    block.text,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                )
+            }
         }
 
         "tool" -> block.tool?.let { ToolCard(it) }

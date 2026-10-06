@@ -45,6 +45,7 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    implementation(libs.androidx.material.icons.core)
     implementation(libs.okhttp)
     implementation(libs.okhttp.sse)
     implementation(libs.kotlinx.serialization.json)
@@ -56,6 +57,8 @@ dependencies {
     implementation(libs.androidx.security.crypto)
     implementation(libs.androidx.biometric)
     implementation(libs.androidx.metrics.performance) // JankStats：流式渲染逐帧耗时采集（debug 门控）
+    implementation(libs.markdown.renderer.core) // Markdown：sealed 文本块定稿渲染
+    implementation(libs.markdown.renderer.m3)
     debugImplementation(libs.androidx.ui.tooling)
 
     testImplementation(libs.junit)
