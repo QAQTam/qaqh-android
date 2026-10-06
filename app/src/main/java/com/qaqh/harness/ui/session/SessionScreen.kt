@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.padding
@@ -31,16 +32,20 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -161,18 +166,33 @@ fun SessionScreen(
         todos?.let { ConnectionService.updateTodoNotification(context, it) }
     }
 
-    // 底部 inset 取 nav bar 与键盘的较大者，避免键盘弹出时输入框悬空一段导航栏高度
-    Column(modifier.fillMaxSize().windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))) {
-        // 顶栏
+    // 底部 inset 取 nav bar 与键盘的较大者；顶部让出状态栏（聊天屏全屏覆盖 tab 壳，无 Scaffold 提供 padding）
+    Column(
+        modifier
+            .fillMaxSize()
+            .windowInsetsPadding(
+                WindowInsets.ime
+                    .union(WindowInsets.navigationBars)
+                    .union(WindowInsets.statusBars),
+            ),
+    ) {
+        // 顶栏：返回 + 会话摘要/ULID + 模型 chip + 状态点
+        val listEntry by ConnectionService.sessions.collectAsState()
+        val sessionInfo by ConnectionService.sessionInfo.collectAsState()
+        val entry = remember(listEntry, sessionInfo, sessionId) {
+            listEntry.find { it.sessionId == sessionId } ?: sessionInfo?.takeIf { it.sessionId == sessionId }
+        }
         Row(
-            Modifier.fillMaxWidth().padding(ScreenPadding),
+            Modifier.fillMaxWidth().padding(horizontal = ScreenPadding, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(BlockSpacing),
         ) {
-            IconButton(onClick = onBack) { Text("←", style = MaterialTheme.typography.titleLarge) }
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+            }
             Column(Modifier.weight(1f)) {
                 Text(
-                    "会话 ${sessionId.take(8)}…",
+                    entry?.lastSummary?.takeIf { it.isNotBlank() } ?: "会话 ${sessionId.take(8)}…",
                     style = MaterialTheme.typography.titleMedium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -183,10 +203,23 @@ fun SessionScreen(
                     "interrupted" -> "已中断"
                     else -> activity ?: ""
                 }
-                Text(
-                    activityText,
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    entry?.model?.let { model ->
+                        Text(
+                            model,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text("·", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Text(
+                        activityText,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (activity == "running") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
 
@@ -240,9 +273,9 @@ fun SessionScreen(
             ApprovalCard(approval, Modifier.padding(horizontal = ScreenPadding))
         }
 
-        // 输入行
+        // 输入行：胶囊输入框 + 圆形发送钮（与玻璃导航条同一圆角语言）
         Row(
-            Modifier.fillMaxWidth().padding(ScreenPadding),
+            Modifier.fillMaxWidth().padding(horizontal = ScreenPadding, vertical = 8.dp),
             verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(BlockSpacing),
         ) {
@@ -252,8 +285,13 @@ fun SessionScreen(
                 placeholder = { Text("发送消息…") },
                 modifier = Modifier.weight(1f),
                 maxLines = 4,
+                shape = RoundedCornerShape(28.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    unfocusedBorderColor = MaterialTheme.colorScheme.surfaceVariant,
+                    focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
+                ),
             )
-            Button(
+            FilledIconButton(
                 enabled = !sending && input.isNotBlank(),
                 onClick = {
                     sending = true
@@ -264,7 +302,11 @@ fun SessionScreen(
                         sending = false
                     }
                 },
-            ) { Text("发送") }
+                shape = CircleShape,
+                modifier = Modifier.size(52.dp),
+            ) {
+                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
+            }
         }
     }
 }

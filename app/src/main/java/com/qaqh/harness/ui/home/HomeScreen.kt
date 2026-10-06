@@ -1,5 +1,10 @@
 package com.qaqh.harness.ui.home
 
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -12,18 +17,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.AssistChip
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -34,54 +38,39 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qaqh.harness.connection.ConnectionService
 import com.qaqh.harness.data.pairing.StoredCredentials
 import com.qaqh.harness.data.ringing.RingingConnection
+import com.qaqh.harness.ui.nav.GlassNavBarContentPadding
 import kotlinx.coroutines.launch
 
 // ---- 布局常量：全屏统一，禁止散落魔数 ----
 private val ScreenPadding = 16.dp
-private val BlockSpacing = 16.dp
+private val BlockSpacing = 12.dp
 private val CardInnerPadding = 16.dp
-private val CardItemSpacing = 8.dp
+private val CardCorner = 24.dp
 private val StatusDotSize = 10.dp
 
-/** 连接状态 → 状态点颜色 / 文案。 */
-private data class ConnectionPresentation(val color: androidx.compose.ui.graphics.Color, val label: String)
+/** 会话活动状态 → 状态点颜色/文案。 */
+private data class ActivityPresentation(val color: androidx.compose.ui.graphics.Color, val label: String)
 
 @Composable
-private fun present(state: RingingConnection.State): ConnectionPresentation =
-    when (state) {
-        is RingingConnection.State.Connected ->
-            ConnectionPresentation(MaterialTheme.colorScheme.primary, "已连接电脑端")
-
-        is RingingConnection.State.Connecting ->
-            ConnectionPresentation(MaterialTheme.colorScheme.tertiary, "正在连接…")
-
-        is RingingConnection.State.Failed ->
-            ConnectionPresentation(MaterialTheme.colorScheme.error, "连接失败（自动重试中）")
-
-        RingingConnection.State.Disconnected ->
-            ConnectionPresentation(MaterialTheme.colorScheme.outline, "未连接")
-    }
-
-/** 会话活动状态 → 徽标文案。 */
-private fun activityLabel(state: String?): String = when (state) {
-    null -> "无活动"
-    "running" -> "工作中"
-    "idle" -> "空闲"
-    "interrupted" -> "已中断"
-    else -> state
+private fun presentActivity(state: String?): ActivityPresentation = when (state) {
+    "running" -> ActivityPresentation(MaterialTheme.colorScheme.primary, "工作中")
+    "idle" -> ActivityPresentation(MaterialTheme.colorScheme.outline, "空闲")
+    "interrupted" -> ActivityPresentation(MaterialTheme.colorScheme.error, "已中断")
+    null -> ActivityPresentation(MaterialTheme.colorScheme.outline, "无活动")
+    else -> ActivityPresentation(MaterialTheme.colorScheme.tertiary, state)
 }
 
 @Composable
 fun HomeScreen(
     credentials: StoredCredentials,
-    onUnpair: () -> Unit,
     onOpenSession: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -113,68 +102,88 @@ fun HomeScreen(
     ) {
         Box(Modifier.fillMaxSize()) {
             LazyColumn(
-                contentPadding = PaddingValues(ScreenPadding),
+                contentPadding = PaddingValues(
+                    start = ScreenPadding,
+                    end = ScreenPadding,
+                    top = 12.dp,
+                    bottom = GlassNavBarContentPadding,
+                ),
                 verticalArrangement = Arrangement.spacedBy(BlockSpacing),
             ) {
-                item { ConnectionHeader(credentials, state, Modifier.fillMaxWidth()) }
+                item { HomeHeader(state, Modifier.fillMaxWidth()) }
 
-                item { Text("会话", style = MaterialTheme.typography.titleMedium) }
                 val list = if (sessions.isEmpty() && session != null) listOfNotNull(session) else sessions
                 items(list, key = { it.sessionId }) { entry ->
                     SessionCard(activity, entry, Modifier.fillMaxWidth()) { onOpenSession(entry.sessionId) }
                 }
                 if (list.isEmpty()) {
-                    item { Text("等待发现活跃会话…", style = MaterialTheme.typography.bodySmall) }
+                    item { EmptySessions(Modifier.fillMaxWidth()) }
                 }
-                item { UnpairButton(onUnpair, Modifier.fillMaxWidth()) }
             }
             ExtendedFloatingActionButton(
                 onClick = {
                     if (!creating && state is RingingConnection.State.Connected) createSession()
                 },
-                modifier = Modifier.align(Alignment.BottomEnd).padding(ScreenPadding),
+                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = ScreenPadding, bottom = GlassNavBarContentPadding - 24.dp),
             ) { Text(if (creating) "创建中…" else "新建会话") }
         }
     }
 }
 
-/** 顶部：应用名 + 状态点 + 状态与地址（单行省略）。 */
+/** 顶部：应用名大标题 + 连接状态点（endpoint 等细节移到设置屏）。 */
 @Composable
-private fun ConnectionHeader(
-    credentials: StoredCredentials,
-    state: RingingConnection.State,
-    modifier: Modifier = Modifier,
-) {
-    val p = present(state)
-    Column(modifier, verticalArrangement = Arrangement.spacedBy(CardItemSpacing)) {
-        Text("QAQ-Harness", style = MaterialTheme.typography.headlineMedium)
+private fun HomeHeader(state: RingingConnection.State, modifier: Modifier = Modifier) {
+    val label = when (state) {
+        is RingingConnection.State.Connected -> "已连接电脑端"
+        is RingingConnection.State.Connecting -> "正在连接…"
+        is RingingConnection.State.Failed -> "连接失败（自动重试中）"
+        RingingConnection.State.Disconnected -> "未连接"
+    }
+    val color = when (state) {
+        is RingingConnection.State.Connected -> MaterialTheme.colorScheme.primary
+        is RingingConnection.State.Connecting -> MaterialTheme.colorScheme.tertiary
+        is RingingConnection.State.Failed -> MaterialTheme.colorScheme.error
+        RingingConnection.State.Disconnected -> MaterialTheme.colorScheme.outline
+    }
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("QAQ Harness", style = MaterialTheme.typography.headlineLarge)
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(CardItemSpacing),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Box(
                 Modifier
                     .size(StatusDotSize)
                     .clip(CircleShape)
-                    .background(p.color)
+                    .background(color)
             )
             Text(
-                p.label,
+                label,
                 style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
             )
         }
-        Text(
-            credentials.baseUrl,
-            style = MaterialTheme.typography.bodySmall,
-            maxLines = 1,
-            overflow = TextOverflow.MiddleEllipsis,
-        )
     }
 }
 
-/** 会话卡片：标题行（含活动徽标）+ 摘要 + 元信息，点击进入聊天屏。 */
+@Composable
+private fun EmptySessions(modifier: Modifier = Modifier) {
+    Text(
+        "等待发现活跃会话…\n下拉刷新，或在电脑端开启一个会话",
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = modifier.padding(vertical = 48.dp),
+    )
+}
+
+/**
+ * 会话卡片（M3 Expressive 大圆角 tonal 卡）：摘要做主标题，ULID 降为元信息；
+ * 状态 = 彩色点 + 文案（运行中有呼吸动画），不再用描边胶囊。
+ */
 @Composable
 private fun SessionCard(
     activity: String?,
@@ -182,31 +191,50 @@ private fun SessionCard(
     modifier: Modifier = Modifier,
     onClick: () -> Unit = {},
 ) {
-    Card(modifier.clickable { onClick() }) {
+    val running = session.running || activity == "running"
+    val ap = presentActivity(if (running) "running" else activity)
+    Card(
+        modifier = modifier.clickable(onClick = onClick, role = Role.Button),
+        shape = RoundedCornerShape(CardCorner),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+        ),
+    ) {
         Column(
             Modifier.padding(CardInnerPadding),
-            verticalArrangement = Arrangement.spacedBy(CardItemSpacing),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(CardItemSpacing),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Text("会话", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                AssistChip(onClick = {}, label = { Text(activityLabel(activity)) })
+                RunningDot(running, ap)
+                Text(
+                    ap.label,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (running) ap.color else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "· ${session.model ?: "未知模型"}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
             }
+            val summary = session.lastSummary?.takeIf { it.isNotBlank() }
             Text(
-                session.lastSummary?.takeIf { it.isNotBlank() } ?: session.sessionId,
-                style = MaterialTheme.typography.bodyMedium,
+                summary ?: "未命名会话",
+                style = MaterialTheme.typography.titleMedium,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.alpha(if (summary == null) 0.6f else 1f),
             )
             Text(
-                listOfNotNull(
-                    session.model ?: "-",
-                    "${session.turnCount} 轮",
-                    if (session.running) "running" else null,
-                ).joinToString(" · "),
-                style = MaterialTheme.typography.bodySmall,
+                "${session.sessionId.take(12)}… · ${session.turnCount} 轮",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -214,7 +242,30 @@ private fun SessionCard(
     }
 }
 
+/** 运行中 = 呼吸动画的状态点；否则静态点。 */
 @Composable
-private fun UnpairButton(onUnpair: () -> Unit, modifier: Modifier = Modifier) {
-    OutlinedButton(onClick = onUnpair, modifier = modifier) { Text("解除配对") }
+private fun RunningDot(running: Boolean, ap: ActivityPresentation) {
+    if (running) {
+        val transition = rememberInfiniteTransition(label = "runningDot")
+        val alpha by transition.animateFloat(
+            initialValue = 1f,
+            targetValue = 0.35f,
+            animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse),
+            label = "runningDotAlpha",
+        )
+        Box(
+            Modifier
+                .size(StatusDotSize)
+                .alpha(alpha)
+                .clip(CircleShape)
+                .background(ap.color)
+        )
+    } else {
+        Box(
+            Modifier
+                .size(StatusDotSize)
+                .clip(CircleShape)
+                .background(ap.color)
+        )
+    }
 }

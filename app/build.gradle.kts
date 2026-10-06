@@ -46,6 +46,10 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
     implementation(libs.androidx.material.icons.core)
+    implementation(libs.androidx.material.icons.extended)
+    implementation(libs.haze) // 玻璃材质：hazeSource 采集内容
+    implementation(libs.haze.blur) // 磨砂玻璃：hazeBlur（悬浮 TabBar / 输入栏）
+    implementation(libs.haze.blur.material3) // HazeBlurStyle.Material3 预设
     implementation(libs.okhttp)
     implementation(libs.okhttp.sse)
     implementation(libs.kotlinx.serialization.json)
