@@ -31,6 +31,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
@@ -54,6 +55,7 @@ dependencies {
     implementation(libs.mlkit.barcode.scanning)
     implementation(libs.androidx.security.crypto)
     implementation(libs.androidx.biometric)
+    implementation(libs.androidx.metrics.performance) // JankStats：流式渲染逐帧耗时采集（debug 门控）
     debugImplementation(libs.androidx.ui.tooling)
 
     testImplementation(libs.junit)

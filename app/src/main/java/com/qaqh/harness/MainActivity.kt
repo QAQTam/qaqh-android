@@ -39,6 +39,15 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        if (com.qaqh.harness.BuildConfig.DEBUG) {
+            // JankStats：流式渲染逐帧耗时采集；>32ms 的帧打日志（logcat 过滤 JankStats）
+            androidx.metrics.performance.JankStats.createAndTrack(window) { frameData ->
+                val ms = frameData.frameDurationUiNanos / 1_000_000.0
+                if (ms >= 32) {
+                    android.util.Log.w("JankStats", "jank frame %.1fms states=${frameData.states}".format(ms))
+                }
+            }
+        }
         setContent {
             MaterialTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->

@@ -14,6 +14,7 @@ mlkitBarcode = "17.3.0"
 securityCrypto = "1.1.0"
 biometric = "1.1.0"
 navigationCompose = "2.9.5"
+jankStats = "1.0.0-beta02"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -39,6 +40,7 @@ androidx-camera-view = { group = "androidx.camera", name = "camera-view", versio
 mlkit-barcode-scanning = { group = "com.google.mlkit", name = "barcode-scanning", version.ref = "mlkitBarcode" }
 androidx-security-crypto = { group = "androidx.security", name = "security-crypto", version.ref = "securityCrypto" }
 androidx-biometric = { group = "androidx.biometric", name = "biometric", version.ref = "biometric" }
+androidx-metrics-performance = { group = "androidx.metrics", name = "metrics-performance", version.ref = "jankStats" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

@@ -156,6 +156,12 @@ class SessionTimeline(
         eventsJob = null
     }
 
+    // ---- 测试钩子（JVM 基准/回归：直接灌帧走真实 reducer，不经网络）----
+
+    internal fun applyFrameForTest(frame: TimelineEntryFrame) = applyFrame(frame)
+
+    internal fun turnsForTest(): List<TimelineTurn> = _turns.value
+
     /** 向上翻页（更早的历史；before_index 是排他游标，取当前最旧 turn_index）。 */
     fun loadOlder() {
         if (endReached || _status.value == Status.Loading) return
