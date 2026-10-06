@@ -7,7 +7,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.UUID
@@ -25,7 +24,7 @@ class PairingClient(private val deviceName: String) {
         val pairing_token: String,
         val device_name: String,
         val platform: String = "android",
-        val scope_request: String = "interact",
+        // 注意：请求体没有 scope_request 字段——档位由桌面端签发 pairing token 时定死
     )
 
     @Serializable
@@ -43,8 +42,6 @@ class PairingClient(private val deviceName: String) {
         explicitNulls = false
     }
 
-    private val http = OkHttpClient()
-
     suspend fun pair(payload: PairingPayload): StoredCredentials = when (payload) {
         is PairingPayload.Direct -> withContext(Dispatchers.IO) { validateDirect(payload) }
         is PairingPayload.Pairing -> withContext(Dispatchers.IO) { exchangePairingToken(payload) }
@@ -52,13 +49,14 @@ class PairingClient(private val deviceName: String) {
 
     private suspend fun validateDirect(payload: PairingPayload.Direct): StoredCredentials {
         // open 成功即视为连通且 token 有效
-        RingingApi(payload.baseUrl, payload.token).open(instanceId())
+        RingingApi(payload.baseUrl, payload.token, pinnedHttpClient(payload.tlsFingerprint)).open(instanceId())
         return StoredCredentials(
             baseUrl = payload.baseUrl,
             token = payload.token,
             deviceId = UUID.randomUUID().toString(),
             deviceName = deviceName,
             pairedAtMs = System.currentTimeMillis(),
+            tlsFingerprint = payload.tlsFingerprint,
         )
     }
 
@@ -73,6 +71,7 @@ class PairingClient(private val deviceName: String) {
                 ).toRequestBody("application/json".toMediaType())
             )
             .build()
+        val http = pinnedHttpClient(payload.tlsFingerprint)
         val response = http.newCall(request).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
@@ -87,7 +86,7 @@ class PairingClient(private val deviceName: String) {
             deviceId = response.device_id,
             deviceName = deviceName,
             pairedAtMs = System.currentTimeMillis(),
-            tlsPinned = payload.tlsFingerprint != null,
+            tlsFingerprint = payload.tlsFingerprint,
         )
     }
 

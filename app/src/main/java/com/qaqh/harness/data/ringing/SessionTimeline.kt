@@ -9,11 +9,13 @@ import com.qaqh.harness.data.ringing.model.TimelineTurn
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -57,17 +59,43 @@ class SessionTimeline(
                 withContext(Dispatchers.IO) {
                     _status.value = Status.Loading
                     loadPage()
-                    // SSE 订阅循环：租约轮换（重连/切会话）后自动带新租约重订阅
+                    // SSE 订阅循环：跟随租约（重连/续租失败轮换/切会话）自动重订阅。
+                    // 不能只在 Connected 状态变化时订阅——续租失败路径的 connectOnce
+                    // 不经过 Connecting，状态不变但租约已换，旧租约的 live 帧会被
+                    // 服务端逐帧静默丢弃（sse.rs should_deliver_timeline_live）。
                     while (isActive) {
-                        val sid = awaitLease()
+                        val sid = connection.leases.first()
+                        android.util.Log.i(TAG, "timeline SSE subscribe lease=${sid.take(8)} session=${sessionId.take(12)}")
                         try {
-                            connection.api.timelineEvents(sid, sessionId).collect { ev ->
-                                when (ev) {
-                                    is RingingApi.TimelineSseEvent.Entry -> applyFrame(ev.frame)
-                                    RingingApi.TimelineSseEvent.Terminated -> Unit
+                            var frames = 0
+                            coroutineScope {
+                                // 等待下一次租约轮换；一旦轮换即取消当前 SSE（立即用新租约重订阅）
+                                val leaseWaiter = launch {
+                                    connection.leases.drop(1).first()
+                                    throw LeaseRotated
+                                }
+                                try {
+                                    connection.api.timelineEvents(sid, sessionId).collect { ev ->
+                                        frames++
+                                        if (frames == 1 || frames % 100 == 0) {
+                                            android.util.Log.i(TAG, "timeline SSE frames=$frames")
+                                        }
+                                        when (ev) {
+                                            is RingingApi.TimelineSseEvent.Entry -> applyFrame(ev.frame)
+                                            RingingApi.TimelineSseEvent.Terminated ->
+                                                android.util.Log.i(TAG, "timeline SSE terminated")
+                                        }
+                                    }
+                                } finally {
+                                    leaseWaiter.cancel()
                                 }
                             }
+                            android.util.Log.i(TAG, "timeline SSE flow completed after $frames frames")
+                        } catch (e: LeaseRotated) {
+                            // 拿新租约立即重订阅
+                            continue
                         } catch (e: RingingApi.ApiException) {
+                            android.util.Log.w(TAG, "timeline SSE ApiException ${e.httpStatus} ${e.code}")
                             if (e.httpStatus != 401) throw e
                         }
                         delay(1_000)
@@ -81,6 +109,8 @@ class SessionTimeline(
             }
         }
     }
+
+    private object LeaseRotated : Exception("lease rotated")
 
     fun stop() {
         eventsJob?.cancel()
@@ -110,7 +140,10 @@ class SessionTimeline(
         return try {
             val ack = withContext(Dispatchers.IO) { connection.sendUserMessage(text) }
             if (ack.status != "accepted") {
-                _sendError.value = "命令未受理：${ack.code ?: ""} ${ack.message ?: ""}".trim()
+                _sendError.value = when (ack.code) {
+                    "not_driver" -> "命令未受理：另一客户端正在驾驶该会话（${ack.message ?: "driver seat occupied"}）"
+                    else -> "命令未受理：${ack.code ?: ""} ${ack.message ?: ""}".trim()
+                }
             } else {
                 // 乐观刷新：不等 SSE，立刻拉最新一页把新 turn 拉上来
                 withContext(Dispatchers.IO) { refreshLatest() }
@@ -175,18 +208,28 @@ class SessionTimeline(
             .let { (it as RingingConnection.State.Connected).clientSessionId }
 
     // ---------- 事件 reducer ----------
+    //
+    // 帧形状对齐 qaqh-domain TimelineEvent（serde tag="type", snake_case）：
+    // - block_opened 的块数据嵌在 event.block 下（TimelineBlock 完整值）；
+    // - text_delta/tool_updated/block_sealed/block_checkpoint/tool_progress
+    //   只带顶层 block_id；
+    // - block_checkpoint：arg 为增量、text 为全量覆写（丢失 TextDelta 时重建用）；
+    // - tool_progress：chunk 追加到工具输出。
 
     private fun applyFrame(frame: TimelineEntryFrame) {
         val type = frame.type ?: return
         val data = frame.event as? JsonObject ?: return
         fun str(key: String): String? = (data[key] as? JsonPrimitive)?.content
         fun long(key: String): Long? = (data[key] as? JsonPrimitive)?.content?.toLongOrNull()
+        fun nestedBlock(): JsonObject? = data["block"] as? JsonObject
 
         _turns.value = when (type) {
             "turn_opened" -> {
                 val incoming = TimelineTurn(
                     turnId = frame.turnId ?: return,
-                    turnIndex = long("turn_index") ?: Int.MAX_VALUE.toLong(),
+                    // 事件里没有 turn_index（那是 TimelineTurn 的字段）：
+                    // 已有 turn（分页加载）保留其序号，新 turn 用 createdSeq 兜底排序
+                    turnIndex = long("turn_index") ?: Long.MAX_VALUE,
                     userText = str("user_text"),
                     state = "running",
                 )
@@ -200,13 +243,16 @@ class SessionTimeline(
             }
 
             "block_opened" -> mutateRoundBlocks(frame) { blocks ->
+                val block = nestedBlock()
+                val blockId = block?.let { (it["block_id"] as? JsonPrimitive)?.content }
+                if (block == null || blockId == null) return@mutateRoundBlocks null
                 val newBlock = TimelineBlock(
-                    blockId = str("block_id") ?: return@mutateRoundBlocks null,
-                    blockOrder = (data["block_order"] as? JsonPrimitive)?.content?.toIntOrNull() ?: blocks.size,
-                    kind = str("kind") ?: "text",
-                    state = "open",
-                    text = str("text"),
-                    tool = data["tool"]?.let { decodeTool(it) },
+                    blockId = blockId,
+                    blockOrder = (block["block_order"] as? JsonPrimitive)?.content?.toIntOrNull() ?: blocks.size,
+                    kind = (block["kind"] as? JsonPrimitive)?.content ?: "text",
+                    state = (block["state"] as? JsonPrimitive)?.content ?: "open",
+                    text = (block["text"] as? JsonPrimitive)?.content,
+                    tool = block["tool"]?.let { decodeTool(it) },
                 )
                 // SSE 重放会重复投递：按 block_id 替换而非追加
                 blocks.filterNot { it.blockId == newBlock.blockId } + newBlock
@@ -216,12 +262,28 @@ class SessionTimeline(
                 block.copy(text = (block.text ?: "") + (str("delta") ?: ""))
             }
 
+            "block_checkpoint" -> mutateBlock(frame, str("block_id") ?: return) { block ->
+                val overwrite = str("text")
+                val increment = str("arg") ?: ""
+                when {
+                    !overwrite.isNullOrEmpty() -> block.copy(text = overwrite)
+                    increment.isNotEmpty() -> block.copy(text = (block.text ?: "") + increment)
+                    else -> block
+                }
+            }
+
             "tool_updated" -> mutateBlock(frame, str("block_id") ?: return) { block ->
                 block.copy(tool = data["tool"]?.let { decodeTool(it) } ?: block.tool)
             }
 
+            "tool_progress" -> mutateBlock(frame, str("block_id") ?: return) { block ->
+                val chunk = str("chunk") ?: return@mutateBlock block
+                val tool = block.tool ?: TimelineTool()
+                block.copy(tool = tool.copy(output = (tool.output ?: "") + chunk))
+            }
+
             "block_sealed" -> mutateBlock(frame, str("block_id") ?: return) { block ->
-                block.copy(state = "sealed", text = str("text") ?: block.text)
+                block.copy(state = "sealed")
             }
 
             "round_sealed" -> mutateTurn(frame) { turn ->
@@ -275,3 +337,5 @@ class SessionTimeline(
         return list.toMutableList().apply { set(idx, transform(get(idx))) }
     }
 }
+
+private const val TAG = "SessionTimeline"

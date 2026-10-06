@@ -52,7 +52,7 @@ fun PairingScreen(
     pairing: Boolean,
     error: String?,
     onPayload: (String) -> Unit,
-    onManual: (endpoint: String, token: String) -> Unit,
+    onManual: (endpoint: String, token: String, tlsFingerprint: String?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -101,25 +101,30 @@ fun PairingScreen(
     if (showManual) {
         ManualEntryDialog(
             onDismiss = { showManual = false },
-            onSubmit = { endpoint, token ->
+            onSubmit = { endpoint, token, fp ->
                 showManual = false
-                onManual(endpoint, token)
+                onManual(endpoint, token, fp?.takeIf { it.isNotBlank() })
             },
         )
     }
 }
 
 @Composable
-private fun ManualEntryDialog(onDismiss: () -> Unit, onSubmit: (String, String) -> Unit) {
-    var endpoint by remember { mutableStateOf("http://") }
+private fun ManualEntryDialog(
+    onDismiss: () -> Unit,
+    onSubmit: (endpoint: String, token: String, tlsFingerprint: String?) -> Unit,
+) {
+    var endpoint by remember { mutableStateOf("https://") }
     var token by remember { mutableStateOf("") }
+    var tlsFp by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("手动配对") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "开发联调降级：输入 daemon 地址与 token（如 qaqh server --bind 输出的 token）。",
+                    "开发联调降级：输入 daemon 地址与 token（如 qaqh server --bind 输出的 token）。" +
+                        "https 自签证书需填 tls_fp（/pairing/tokens 返回的指纹）。",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 OutlinedTextField(
@@ -136,12 +141,21 @@ private fun ManualEntryDialog(onDismiss: () -> Unit, onSubmit: (String, String) 
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                OutlinedTextField(
+                    value = tlsFp,
+                    onValueChange = { tlsFp = it },
+                    label = { Text("TLS 指纹（https 时必填）") },
+                    placeholder = { Text("sha256:…") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
             }
         },
         confirmButton = {
+            val needsFp = endpoint.trim().startsWith("https")
             TextButton(
-                onClick = { onSubmit(endpoint.trim().trimEnd('/'), token.trim()) },
-                enabled = endpoint.startsWith("http") && token.isNotEmpty(),
+                onClick = { onSubmit(endpoint.trim().trimEnd('/'), token.trim(), tlsFp.trim()) },
+                enabled = endpoint.startsWith("http") && token.isNotEmpty() && (!needsFp || tlsFp.isNotBlank()),
             ) { Text("配对") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },

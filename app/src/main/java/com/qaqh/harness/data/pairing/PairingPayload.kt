@@ -21,10 +21,11 @@ sealed interface PairingPayload {
         val hostName: String?,
     ) : PairingPayload
 
-    /** 开发降级：直接携带可用的 Bearer token（明文 HTTP，仅限联调）。 */
+    /** 开发降级：直接携带可用的 Bearer token；https 自签时需带 tls_fp。 */
     data class Direct(
         val baseUrl: String,
         val token: String,
+        val tlsFingerprint: String? = null,
     ) : PairingPayload
 
     companion object {
@@ -80,14 +81,15 @@ sealed interface PairingPayload {
 
 class PairingPayloadException(message: String) : Exception(message)
 
-/** 配对完成后本地保存的凭据。 */
-@Serializable
-data class StoredCredentials(
-    val baseUrl: String,
-    val token: String,
-    /** 正式配对后的设备 id（/pair 返回）；开发降级为本地生成。 */
-    val deviceId: String,
-    val deviceName: String,
-    val pairedAtMs: Long,
-    val tlsPinned: Boolean = false,
-)
+    /** 配对完成后本地保存的凭据。 */
+    @Serializable
+    data class StoredCredentials(
+        val baseUrl: String,
+        val token: String,
+        /** 正式配对后的设备 id（/pair 返回）；开发降级为本地生成。 */
+        val deviceId: String,
+        val deviceName: String,
+        val pairedAtMs: Long,
+        /** daemon 证书 SPKI sha256（https 自签时的信任锚）；null = 不 pin（明文 http）。 */
+        val tlsFingerprint: String? = null,
+    )

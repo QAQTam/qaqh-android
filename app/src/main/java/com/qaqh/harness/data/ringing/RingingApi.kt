@@ -162,6 +162,10 @@ class RingingApi(
                     else -> runCatching {
                         TimelineSseEvent.Entry(json.decodeFromString<TimelineEntryEnvelope>(data).entry)
                     }.onSuccess { trySendBlocking(it) }
+                        .onFailure {
+                            // 静默吞掉解码失败会让上层表现为"零帧"且无线索，必须留痕
+                            android.util.Log.w("RingingApi", "timeline frame decode failed: $it; data=${data.take(300)}")
+                        }
                 }
             }
 
@@ -211,8 +215,10 @@ class RingingApi(
             .header("Accept", "text/event-stream")
             .build()
 
+        // 必须用 sseHttp（readTimeout=0）：默认 client 10s 读超时会掐断空闲 SSE，
+        // 造成 ~11s 周期的重连风暴（每次重连都换 client_session_id）。
         lateinit var source: EventSource
-        source = EventSources.createFactory(http).newEventSource(request, object : EventSourceListener() {
+        source = EventSources.createFactory(sseHttp).newEventSource(request, object : EventSourceListener() {
             override fun onOpen(eventSource: EventSource, response: Response) {
                 if (!response.isSuccessful) {
                     val body = runCatching { response.body?.string() }.getOrNull().orEmpty()

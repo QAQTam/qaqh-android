@@ -79,6 +79,17 @@ fun AppRoot(innerPadding: androidx.compose.foundation.layout.PaddingValues, modi
     // 两级导航：会话列表 ↔ 聊天屏
     var openSessionId by remember { mutableStateOf<String?>(null) }
 
+    // 设备被吊销（服务端全 401）：自动掉回配对屏
+    LaunchedEffect(Unit) {
+        ConnectionService.authRevoked.collect { revoked ->
+            if (revoked) {
+                credentials = null
+                openSessionId = null
+                ConnectionService.consumeAuthRevoked()
+            }
+        }
+    }
+
     if (credentials == null) {
         PairingScreen(
             pairing = pairing,
@@ -103,13 +114,13 @@ fun AppRoot(innerPadding: androidx.compose.foundation.layout.PaddingValues, modi
                     }
                 }
             },
-            onManual = { endpoint, token ->
+            onManual = { endpoint, token, tlsFp ->
                 if (!pairing) {
                     pairing = true
                     error = null
                     scope.launch {
                         try {
-                            val creds = client.pair(PairingPayload.Direct(endpoint, token))
+                            val creds = client.pair(PairingPayload.Direct(endpoint, token, tlsFp))
                             store.save(creds)
                             credentials = creds
                         } catch (e: Exception) {

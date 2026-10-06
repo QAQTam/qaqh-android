@@ -56,7 +56,11 @@ class RingingConnection(
             val clientSessionId: String,
         ) : State
 
-        data class Failed(val reason: String) : State
+        data class Failed(
+            val reason: String,
+            /** 401（token 无效/设备被吊销）：UI 应掉回配对屏，而不是无限重试。 */
+            val unauthorized: Boolean = false,
+        ) : State
     }
 
     /** 从 SSE 投影出的会话事件。 */
@@ -80,6 +84,17 @@ class RingingConnection(
 
     private val _events = MutableSharedFlow<SessionEvent>(extraBufferCapacity = 64)
     val events: SharedFlow<SessionEvent> = _events
+
+    /**
+     * 当前活跃租约（clientSessionId），每次 open 成功发新值（replay=1，新订阅者
+     * 立即拿到现值）。timeline SSE 等 attach 门控流必须跟随它重订阅——租约轮换后
+     * 旧租约的 live 帧会被服务端逐帧静默丢弃（sse.rs should_deliver_timeline_live）。
+     */
+    private val _leases = MutableSharedFlow<String>(
+        replay = 1,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+    val leases: SharedFlow<String> = _leases
 
     private var instanceId: String = UUID.randomUUID().toString()
     private var clientSessionId: String? = null
@@ -143,28 +158,50 @@ class RingingConnection(
 
     /**
      * 发送用户消息（conversation 通道，driver 门控）。
-     * 无人认领时直接放行；被拒（not_driver）则先 claim 再重试一次。
+     * 无人认领时直接放行；被拒（not_driver）则 claim 后重试——claim 是异步生效
+     * （席位经 DriverChanged 落地），且他人租约未过期时 claim 会被拒（driver_busy），
+     * 因此短退避重试数轮，仍失败则把占用状态作为最终错误返回。
      */
-    suspend fun sendUserMessage(text: String): CommandAck {
-        val ack = postCommand(RingingProtocol.CHANNEL_CONVERSATION, CommandEnvelope.conversationSendMessage(text))
-        if (ack.status == "rejected" && ack.code == "not_driver") {
-            val sid = mutex.withLock { clientSessionId } ?: error("not connected")
-            val seed = mutex.withLock { sessionId }
-            api.driverClaim(sid, seed ?: error("no session"))
-            return postCommand(RingingProtocol.CHANNEL_CONVERSATION, CommandEnvelope.conversationSendMessage(text))
+    suspend fun sendUserMessage(text: String): CommandAck =
+        sendWithDriverRecovery(RingingProtocol.CHANNEL_CONVERSATION) {
+            CommandEnvelope.conversationSendMessage(text)
         }
-        return ack
+
+    /** 新建会话（control 通道）；not_driver 恢复策略同 [sendUserMessage]。 */
+    suspend fun createSession(): CommandAck =
+        sendWithDriverRecovery(RingingProtocol.CHANNEL_CONTROL) { CommandEnvelope.sessionCreate() }
+
+    private suspend fun sendWithDriverRecovery(
+        channel: String,
+        envelope: () -> kotlinx.serialization.json.JsonObject,
+    ): CommandAck {
+        var ack = postCommand(channel, envelope())
+        if (ack.status != "rejected" || ack.code != "not_driver") return ack
+        // 最多 3 轮 claim+重试；每轮之间给 claim 落地/对方租约过期留时间。
+        repeat(3) { attempt ->
+            val claimResult = claimDriverSeat()
+            when {
+                // 席位已归我或已认领：稍等落地后重试命令
+                claimResult.isSuccess -> delay(300L * (attempt + 1))
+                // 他人租约仍活跃（driver_busy）：等其过期再试
+                else -> delay(2_000L * (attempt + 1))
+            }
+            ack = postCommand(channel, envelope())
+            if (ack.status != "rejected" || ack.code != "not_driver") return ack
+        }
+        return ack.copy(
+            message = ack.message ?: "另一客户端正在驾驶该会话，稍后重试",
+        )
     }
 
-    /** 新建会话（control 通道）；被拒 not_driver 时先 claim 再重试一次。 */
-    suspend fun createSession(): CommandAck {
-        val ack = postCommand(RingingProtocol.CHANNEL_CONTROL, CommandEnvelope.sessionCreate())
-        if (ack.status == "rejected" && ack.code == "not_driver") {
-            val sid = mutex.withLock { clientSessionId } ?: error("not connected")
-            api.driverClaim(sid, mutex.withLock { sessionId } ?: error("no session"))
-            return postCommand(RingingProtocol.CHANNEL_CONTROL, CommandEnvelope.sessionCreate())
+    /** 认领 driver 席位；返回 claim 是否已被接受（already_holder / claim_requested 均算）。 */
+    private suspend fun claimDriverSeat(): Result<Unit> {
+        val sid = mutex.withLock { clientSessionId } ?: return Result.failure(IllegalStateException("not connected"))
+        val seed = mutex.withLock { sessionId } ?: return Result.failure(IllegalStateException("no session"))
+        // mapCatching：Result.map 不捕获 transform 异常，require 抛出会漏到调用方
+        return runCatching { api.driverClaim(sid, seed) }.mapCatching { resp ->
+            require(resp.accepted) { "driver_busy: ${resp.reason ?: "unknown"}" } // accepted=false 即他人租约仍活跃
         }
-        return ack
     }
 
     private suspend fun postCommand(channel: String, command: kotlinx.serialization.json.JsonObject): CommandAck {
@@ -194,7 +231,11 @@ class RingingConnection(
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
-                _state.value = State.Failed(e.message ?: e.javaClass.simpleName)
+                android.util.Log.w(TAG, "connection loop failure: ${e.message}", e)
+                _state.value = State.Failed(
+                    e.message ?: e.javaClass.simpleName,
+                    unauthorized = (e as? RingingApi.ApiException)?.isUnauthorized == true,
+                )
             }
             delay(backoffMs)
             backoffMs = min(backoffMs * 2, 30_000L)
@@ -215,6 +256,7 @@ class RingingConnection(
                 .onFailure { android.util.Log.w(TAG, "attach FAILED: $it") }
         }
         mutex.withLock { _state.value = State.Connected(open.serverEpoch, open.clientSessionId) }
+        _leases.tryEmit(open.clientSessionId)
         startRenewLoop(open.renewIntervalMs)
     }
 

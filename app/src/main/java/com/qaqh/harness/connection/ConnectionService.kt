@@ -11,6 +11,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.qaqh.harness.MainActivity
 import com.qaqh.harness.data.pairing.CredentialStore
+import com.qaqh.harness.data.pairing.pinnedHttpClient
 import com.qaqh.harness.data.ringing.RingingConnection
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -63,12 +64,21 @@ class ConnectionService : Service() {
             token = creds.token,
             sessionId = null, // 先建租约，发现会话后再 setSessionId
             scope = scope,
+            client = pinnedHttpClient(creds.tlsFingerprint), // https 自签：SPKI 指纹即信任锚
         )
         connection = conn
         Companion.connection = conn
         scope.launch { conn.events.collect { handleEvent(it) } } // handleEvent 为 suspend，逐事件串行处理
         scope.launch {
             conn.state.collect { st ->
+                // 设备被吊销/token 失效：清凭据停服务，让 UI 掉回配对屏（避免 401 无限重试）
+                if (st is RingingConnection.State.Failed && st.unauthorized) {
+                    android.util.Log.w("ConnectionService", "401 from daemon — device token invalid/revoked, unpairing")
+                    CredentialStore(this@ConnectionService).clear()
+                    _authRevoked.value = true
+                    stopSelf()
+                    return@collect
+                }
                 _connectionState.value = st
                 notifyStatus(
                     when (st) {
@@ -324,6 +334,14 @@ class ConnectionService : Service() {
 
         private val _lastRespondError = MutableStateFlow<String?>(null)
         val lastRespondError: StateFlow<String?> = _lastRespondError.asStateFlow()
+
+        /** 设备凭据被 daemon 拒绝（吊销/token 轮换）：UI 消费后应掉回配对屏。 */
+        private val _authRevoked = MutableStateFlow(false)
+        val authRevoked: StateFlow<Boolean> = _authRevoked.asStateFlow()
+
+        fun consumeAuthRevoked() {
+            _authRevoked.value = false
+        }
 
         /** 审批应答：按 kind 分派；当前阶段仍用 canonical id（后端 M0 后换 opaque challenge id）。 */
         suspend fun respondApproval(approval: PendingApproval, approved: Boolean): Result<com.qaqh.harness.data.ringing.model.CommandAck> {
