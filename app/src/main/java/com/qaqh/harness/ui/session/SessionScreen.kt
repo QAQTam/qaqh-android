@@ -559,7 +559,25 @@ private fun BlockItem(block: TimelineBlock) {
         "text" -> if (!block.text.isNullOrBlank()) {
             if (block.state == "sealed") {
                 // 定稿：Markdown 渲染（参数不变时 Compose 跳过重组合，解析只在块定稿时发生一次）
-                com.mikepenz.markdown.m3.Markdown(block.text)
+                // 标题映射降到 title 级（库默认 h1=displayLarge，聊天流里一个标题占半屏）；
+                // 正文统一 bodyMedium，与流式纯文本一致，避免 sealed 瞬间字号跳变
+                com.mikepenz.markdown.m3.Markdown(
+                    block.text,
+                    typography = com.mikepenz.markdown.m3.markdownTypography(
+                        h1 = MaterialTheme.typography.titleLarge,
+                        h2 = MaterialTheme.typography.titleLarge,
+                        h3 = MaterialTheme.typography.titleMedium,
+                        h4 = MaterialTheme.typography.titleMedium,
+                        h5 = MaterialTheme.typography.titleSmall,
+                        h6 = MaterialTheme.typography.titleSmall,
+                        text = MaterialTheme.typography.bodyMedium,
+                        paragraph = MaterialTheme.typography.bodyMedium,
+                        ordered = MaterialTheme.typography.bodyMedium,
+                        bullet = MaterialTheme.typography.bodyMedium,
+                        list = MaterialTheme.typography.bodyMedium,
+                        table = MaterialTheme.typography.bodyMedium,
+                    ),
+                )
             } else {
                 // 流式中：纯文本 + 只渲染尾部（webui 同款策略——增长的段落每帧全量重排版
                 // 是 jank 主因，尾部截断把重排版成本封顶；sealed 后全文 Markdown）
