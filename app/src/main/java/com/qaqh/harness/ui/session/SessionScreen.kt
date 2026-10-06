@@ -801,11 +801,13 @@ fun ApprovalCard(approval: PendingApproval, modifier: Modifier = Modifier) {
         val fragmentActivity = context as? androidx.fragment.app.FragmentActivity
         fun proceed() {
             scope.launch {
-                ConnectionService.respondApproval(approval, approved)
+                ConnectionService.respondApproval(context, approval, approved)
                 busy = false
             }
         }
-        if (fragmentActivity == null) {
+        // 只有放行/拒绝类操作需要生物认证；ask 的"关闭（中止回合）"不是授权行为，
+        // 不该要求指纹/密码
+        if (approval.kind == "ask" || fragmentActivity == null) {
             proceed()
             return
         }

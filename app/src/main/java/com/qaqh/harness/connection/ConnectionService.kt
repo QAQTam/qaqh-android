@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** 当前待审批（v2 interaction_requested, kind=permission）投影。 */
@@ -71,15 +72,22 @@ class ConnectionService : Service() {
         Companion.connection = conn
         scope.launch { conn.events.collect { handleEvent(it) } } // handleEvent 为 suspend，逐事件串行处理
         scope.launch {
+            var unauthorizedFailures = 0
             conn.state.collect { st ->
-                // 设备被吊销/token 失效：清凭据停服务，让 UI 掉回配对屏（避免 401 无限重试）
                 if (st is RingingConnection.State.Failed && st.unauthorized) {
-                    android.util.Log.w("ConnectionService", "401 from daemon — device token invalid/revoked, unpairing")
+                    // 连续 2 次真鉴权失败才认定吊销（单次 401 可能是竞态误报，wipe 不可逆）
+                    unauthorizedFailures++
+                    if (unauthorizedFailures < 2) {
+                        notifyStatus("认证异常，重试中…")
+                        return@collect
+                    }
+                    android.util.Log.w("ConnectionService", "repeated 401 from daemon — device token invalid/revoked, unpairing")
                     CredentialStore(this@ConnectionService).clear()
                     _authRevoked.value = true
                     stopSelf()
                     return@collect
                 }
+                unauthorizedFailures = 0
                 _connectionState.value = st
                 notifyStatus(
                     when (st) {
@@ -167,23 +175,45 @@ class ConnectionService : Service() {
         }
     }
 
+    private val summaryJson = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+
+    /** ask 载荷（{questions:[{question,options}...]}，可能作为 JSON 字符串嵌在 text 里）→ 摘要。 */
+    private fun askSummaryOf(element: kotlinx.serialization.json.JsonElement?): String? {
+        val obj = element as? kotlinx.serialization.json.JsonObject ?: return null
+        val questions = obj["questions"] as? kotlinx.serialization.json.JsonArray ?: return null
+        val texts = questions.mapNotNull { q ->
+            ((q as? kotlinx.serialization.json.JsonObject)?.get("question") as? kotlinx.serialization.json.JsonPrimitive)
+                ?.content?.trim()?.takeIf { it.isNotEmpty() }
+        }
+        if (texts.isEmpty()) return null
+        return if (texts.size == 1) texts[0] else "共 ${texts.size} 问：${texts[0]}"
+    }
+
     private suspend fun extractSummary(r: com.qaqh.harness.data.ringing.model.InteractionRequested): String {
         // request 是 ContentValue {kind:"inline",data:{text:...}} 或 {kind:"ref",data:{content_ref:"sha256:..."}}
         val data = (r.request as? kotlinx.serialization.json.JsonObject)?.get("data")
             as? kotlinx.serialization.json.JsonObject
-        (data?.get("text") as? kotlinx.serialization.json.JsonPrimitive)?.content?.let { return it }
-        // ref 型：拉原文（需已 attach）；原文可能是 {"text":...} JSON 或纯文本
+        android.util.Log.i("ConnectionService", "extractSummary kind=${r.kind} request=${r.request.toString().take(160)}")
+        (data?.get("text") as? kotlinx.serialization.json.JsonPrimitive)?.content?.let { text ->
+            // ask 载荷常以 JSON 字符串嵌在 text 里：能解析出 questions 就取问题文本，不透传原始 JSON
+            runCatching { summaryJson.parseToJsonElement(text) }.getOrNull()?.let { parsed ->
+                askSummaryOf(parsed)?.let { return it }
+            }
+            return text
+        }
+        askSummaryOf(data)?.let { return it }
+        // ref 型：拉原文（需已 attach）；原文可能是 ask 载荷 JSON、{"text":...} 或纯文本
         val contentRef = (data?.get("content_ref") as? kotlinx.serialization.json.JsonPrimitive)?.content
         if (contentRef != null) {
             val sid = (_connectionState.value as? RingingConnection.State.Connected)?.clientSessionId
             if (sid != null) {
                 val raw = runCatching { withTimeoutOrNull(5_000) { connection?.api?.content(sid, contentRef) } }.getOrNull()
                 if (!raw.isNullOrBlank()) {
-                    val parsed = runCatching {
-                        (connection?.api?.json?.parseToJsonElement(raw) as? kotlinx.serialization.json.JsonObject)
-                            ?.get("text") as? kotlinx.serialization.json.JsonPrimitive
-                    }.getOrNull()?.content
-                    return parsed ?: raw.take(300)
+                    val parsed = runCatching { connection?.api?.json?.parseToJsonElement(raw) }.getOrNull()
+                    askSummaryOf(parsed)?.let { return it }
+                    val parsedText = (parsed as? kotlinx.serialization.json.JsonObject)
+                        ?.get("text") as? kotlinx.serialization.json.JsonPrimitive
+                    return parsedText?.content ?: raw.take(300)
                 }
             }
         }
@@ -308,7 +338,8 @@ class ConnectionService : Service() {
         /** 立即刷新会话列表（进入列表屏/下拉刷新时调用）；未连接时等连接就绪后再拉（最多等 10s）。 */
         fun refreshNow(scope: kotlinx.coroutines.CoroutineScope) {
             val conn = connection ?: return
-            scope.launch {
+            // 调用方常是 UI scope（HomeScreen rememberCoroutineScope）→ 显式 IO
+            scope.launch(Dispatchers.IO) {
                 if (withTimeoutOrNull(10_000) { conn.state.first { it is RingingConnection.State.Connected } } == null) {
                     return@launch
                 }
@@ -412,15 +443,29 @@ class ConnectionService : Service() {
         }
 
         /** 审批应答：按 kind 分派；当前阶段仍用 canonical id（后端 M0 后换 opaque challenge id）。 */
-        suspend fun respondApproval(approval: PendingApproval, approved: Boolean): Result<com.qaqh.harness.data.ringing.model.CommandAck> {
+        suspend fun respondApproval(
+            context: Context,
+            approval: PendingApproval,
+            approved: Boolean,
+        ): Result<com.qaqh.harness.data.ringing.model.CommandAck> {
             val conn = connection ?: return Result.failure(IllegalStateException("未连接"))
-            val result = runCatching { conn.respondInteraction(approval.kind, approval.interactionId, approval.callId, approved) }
+            // 调用方是 UI scope，网络必须切 IO（否则 NetworkOnMainThreadException）
+            val result = runCatching {
+                withContext(Dispatchers.IO) { conn.respondInteraction(approval.kind, approval.interactionId, approval.callId, approved) }
+            }
             result.onSuccess { ack ->
                 if (ack.status != "accepted") {
                     _lastRespondError.value = "命令被拒绝：${ack.code ?: ""} ${ack.message ?: ""}"
+                } else {
+                    // 乐观移除：ack 已受理就先撤面板和通知，不等 SSE interaction_resolved
+                    //（个别应答路径的事件归因链路后端仍在补，迟到/丢失会让面板僵住）
+                    context.getSystemService(NotificationManager::class.java)
+                        .cancel(APPROVAL_NOTIFICATION_BASE + approval.interactionId.hashCode())
+                    _pendingApprovals.value =
+                        _pendingApprovals.value.filterNot { it.interactionId == approval.interactionId }
                 }
             }.onFailure { e ->
-                _lastRespondError.value = "应答失败：${e.message}"
+                _lastRespondError.value = "应答失败：${e.message ?: e.javaClass.simpleName}"
             }
             return result
         }

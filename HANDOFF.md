@@ -2,6 +2,17 @@
 
 给后续会话/接手者的交接说明。规划见 [PLAN.md](PLAN.md)。
 
+## 本轮收尾状态（2026-10-06 下午，接手者从这里继续）
+
+- **未提交改动已含全部修复，先 `git add -A && git commit`**（若上一会话没来得及提交）。
+- **ask（提问）面板三连修（真机验证）**：①"关闭（中止回合）"不再弹生物认证（那是授权动作的关卡，ask 中止不是授权，`ApprovalCard.respondWithGate` 对 kind=ask 直接放行）；②ack 一被接受就**乐观移除**面板和通知（`respondApproval` 成功分支 filterNot），不再等可能迟到/丢失的 `interaction_resolved` SSE——这是"点关闭面板不消失"的主因；③摘要清洗：**ask 的 request 是 ref 型**（`{kind:"ref",data:{content_ref}}`），fetch `/content/{id}` 拉回的原文就是 ask 载荷 JSON（`{kind:"ask",questions:[{question,options}]}`）——`extractSummary` 现在先 `askSummaryOf` 解析出问题文本（如"你更喜欢猫还是狗？"），不再透传原始 JSON。inline text 里嵌 JSON 的形状也兜了。
+- **⚠️ 凭据丢失第 5 次的真相（重要，收回旧结论）**：不是 OPPO ESP 又坏了——是本日新增的"吊销自动掉回配对屏"**误杀**：后端 `lease_required`（401+JSON code）也被判成吊销 → `CredentialStore.clear()` 把主存和备份一起清了（备份文件 `<map />` 即证据）。已修两层：①`RingingConnection` 只有无 code 的真鉴权失败（后端 auth.rs 裸文本 "unauthorized"）才置 `unauthorized=true`，`lease_required` 排除；②ConnectionService 需**连续 2 次**真鉴权失败才 wipe（单次不 reversibly 清凭据）。**给后端**：`lease_required` 与鉴权失败共用 401 但形态不同（JSON code vs 纯文本），建议长期分开状态码。
+- **连接风暴修复**：`runWithBackoff` 的退避重置原来在 `connectOnce()` 成功后立即执行——bootstrap 持续失败（本日实测 `409 snapshot_missing: canonical snapshot cursor is unavailable`，正是后端 v1/v2 迁移正在处理的问题）时 connectOnce 每次都成功 → 退避永远 1s → attach 风暴（实测 ~1.1s/次）。已改为**只有走完 connectOnce+streamEvents 完整周期才重置**，失败按 1→2→4…30s 指数退避。
+- **NetworkOnMainThreadException 两例（模式教训）**：`ConnectionService` companion 里的网络函数若从 UI scope 调用必须切 IO——`respondApproval`（UI 协程直接调，已 `withContext(Dispatchers.IO)`）和 `refreshNow`（`scope.launch(Dispatchers.IO)`）。新代码凡在 companion 暴露 suspend 网络函数的，默认套 IO。
+- **真机验证过**：ask 摘要干净、点关闭无生物认证、面板即点即消失（最后截图面板已消失，会话恢复可发消息——注意验证时该会话正被后端 409 snapshot_missing 折腾，属后端侧）。
+- **遗留（按优先级）**：① ask 回答表单（questions 渲染 + answers 提交）——与 M0 challenge 流一体，等后端 v2（`/approvals/respond` ask→submit{answers}）；② M0 challenge 流切换（同前，等 device 身份配对可用）；③ 流式期尾部渲染已做（streamTail 1200 字符），若还有 jank 再深化；④ 重复会话洪水（39 个 raw，联调测试制造）需要在 daemon 侧清理或加防护；⑤ OPPO ESP 依旧不可信（双写兜底保留），长期可考虑迁移到 Keystore 直管 + 文件加密。
+- **调试技巧补充**：`adb shell input text` 遇空格必须用 `%s`（否则截断在第一个空格）；键盘弹起后发送按钮位置会变，点前重新 uiautomator dump；`logcat -c` 时机要小心——排查"日志没出现"前先确认不是自己清掉的；OPPO 进程日志配额会丢 D 级日志，关键探针用 I/W 级。
+
 ## 项目现状（2026-10-06）
 
 - **TLS + SPKI pinning 已完成并真机验证（2026-10-06）**：daemon 已启用自签 rustls（https，`daemon.json` endpoint 已是 https://60.0.0.65:64413）。新增 `data/pairing/TlsPinning.kt`：`SpkiPinnedTrustManager`（指纹即信任根，不做有效期/主机名校验）+ `pinnedHttpClient(fp)`，注入 PairingClient（配对时）与 ConnectionService→RingingConnection（运行期）；`StoredCredentials.tlsFingerprint` 持久化指纹；手输配对对话框增加"TLS 指纹"必填项（https 时）。⚠️ **后端 bug 待反馈**：`/pairing/tokens` 返回的 `tls_fp` 实际是**整张 DER 证书**的 sha256（`tls.rs:46 sha256_hex(leaf.as_ref())`），与 `types.rs:101` 自己的文档（"SPKI 的 sha256"，与 OkHttp pin 语义对齐）不符。安卓端已兼容两种语义（都算、任一匹配）；若后端改齐为 SPKI 也无需改安卓端。

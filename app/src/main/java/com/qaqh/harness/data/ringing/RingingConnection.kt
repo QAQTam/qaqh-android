@@ -226,15 +226,20 @@ class RingingConnection(
             _state.value = State.Connecting
             try {
                 connectOnce()
-                backoffMs = 1_000L
                 streamEvents()
+                // 只有走完一个完整周期（连接+流结束）才重置退避——否则 bootstrap 持续
+                // 失败（如 409 snapshot_missing）会因 connectOnce 每次成功而重置成 1s 风暴
+                backoffMs = 1_000L
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "connection loop failure: ${e.message}", e)
+                // 只有"真鉴权失败"（无 code 的 unauthorized）才算吊销；lease_required 也是 401，
+                // 但只是租约没 attach，属于常规竞态，绝不能触发清凭据
+                val apiException = e as? RingingApi.ApiException
                 _state.value = State.Failed(
                     e.message ?: e.javaClass.simpleName,
-                    unauthorized = (e as? RingingApi.ApiException)?.isUnauthorized == true,
+                    unauthorized = apiException?.isUnauthorized == true && apiException.code != "lease_required",
                 )
             }
             delay(backoffMs)
