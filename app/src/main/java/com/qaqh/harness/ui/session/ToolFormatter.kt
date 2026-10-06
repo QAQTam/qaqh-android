@@ -136,6 +136,13 @@ object ToolFormatter {
         }
     }
 
+    /** 统一 diff（文件变更类工具）：顶层 diff 或 typed body 的 unified。 */
+    fun diff(tool: TimelineTool): String? {
+        tool.diff?.takeIf { it.isNotBlank() }?.let { return it }
+        val b = tool.display?.body ?: return null
+        return if (b.str("kind") == "diff") b.str("unified") else null
+    }
+
     private fun typedBodyField(tool: TimelineTool, key: String): Int? =
         (tool.display?.body?.get(key) as? JsonPrimitive)?.content?.toIntOrNull()
 

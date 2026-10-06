@@ -95,6 +95,7 @@ fun SessionScreen(
     val timeline = remember(sessionId) { SessionTimeline(connection, sessionId, scope) }
     val turns by timeline.turns.collectAsState()
     val status by timeline.status.collectAsState()
+    val todos by timeline.todos.collectAsState()
     val approvals by ConnectionService.pendingApprovals.collectAsState()
     val respondError by ConnectionService.lastRespondError.collectAsState()
     val sendError by timeline.sendError.collectAsState()
@@ -155,6 +156,11 @@ fun SessionScreen(
         }
     }
 
+    // 待办 → 实况通知（SSE 只在屏内流动，由屏驱动通知更新）
+    LaunchedEffect(todos) {
+        todos?.let { ConnectionService.updateTodoNotification(context, it) }
+    }
+
     // 底部 inset 取 nav bar 与键盘的较大者，避免键盘弹出时输入框悬空一段导航栏高度
     Column(modifier.fillMaxSize().windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))) {
         // 顶栏
@@ -182,6 +188,11 @@ fun SessionScreen(
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
+        }
+
+        // 待办清单（进行中→待办→已完成；全部完成自动隐藏）
+        todos?.takeIf { !it.allDone }?.let { todo ->
+            TodoPanel(todo, Modifier.padding(horizontal = ScreenPadding))
         }
 
         // 聊天区
@@ -254,6 +265,63 @@ fun SessionScreen(
                     }
                 },
             ) { Text("发送") }
+        }
+    }
+}
+
+/** 流式期只渲染尾部：封顶单次重排版成本（sealed 后由 Markdown 渲染全文）。 */
+private fun streamTail(text: String, max: Int = 1_200): String =
+    if (text.length <= max + 300) text else "…" + text.takeLast(max)
+
+/**
+ * 待办清单面板：进行中→待办→已完成排序，折叠预览 3 行；全部完成时整个隐藏（调用方保证）。
+ */
+@Composable
+private fun TodoPanel(todo: com.qaqh.harness.data.ringing.model.TodoState, modifier: Modifier = Modifier) {
+    var expanded by remember { mutableStateOf(false) }
+    val items = todo.ordered()
+    val visible = if (expanded) items else items.take(3)
+    Card(modifier) {
+        Column(Modifier.padding(CardInnerPadding), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "待办 ${todo.completed}/${todo.total}",
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.weight(1f),
+                )
+                if (items.size > 3) {
+                    TextButton(onClick = { expanded = !expanded }) {
+                        Text(if (expanded) "收起" else "展开 ${items.size} 项", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+            visible.forEach { item ->
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(BlockSpacing),
+                ) {
+                    val (marker, color) = when (item.status) {
+                        com.qaqh.harness.data.ringing.model.TodoStatus.COMPLETED ->
+                            "✓" to MaterialTheme.colorScheme.primary
+                        com.qaqh.harness.data.ringing.model.TodoStatus.IN_PROGRESS ->
+                            "▸" to MaterialTheme.colorScheme.tertiary
+                        com.qaqh.harness.data.ringing.model.TodoStatus.PENDING ->
+                            "○" to MaterialTheme.colorScheme.outline
+                    }
+                    Text(marker, style = MaterialTheme.typography.bodyMedium, color = color)
+                    Text(
+                        item.title.ifBlank { item.id },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (item.status == com.qaqh.harness.data.ringing.model.TodoStatus.COMPLETED) {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
         }
     }
 }
@@ -494,9 +562,10 @@ private fun BlockItem(block: TimelineBlock) {
                 // 定稿：Markdown 渲染（参数不变时 Compose 跳过重组合，解析只在块定稿时发生一次）
                 com.mikepenz.markdown.m3.Markdown(block.text)
             } else {
-                // 流式中：纯文本（每帧重解析 Markdown 是唯一的卡顿做法，避开）
+                // 流式中：纯文本 + 只渲染尾部（webui 同款策略——增长的段落每帧全量重排版
+                // 是 jank 主因，尾部截断把重排版成本封顶；sealed 后全文 Markdown）
                 Text(
-                    block.text,
+                    streamTail(block.text),
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
                 )
@@ -613,6 +682,8 @@ private fun ToolCard(tool: TimelineTool) {
             }
             // 折叠预览：输出尾部 3 行；展开：全文
             if (expanded) {
+                // 文件变更类：统一 diff 着色（+/−/@）
+                ToolFormatter.diff(tool)?.let { DiffView(it) }
                 body?.let { text ->
                     Text(
                         text,
@@ -677,6 +748,38 @@ private fun ToolCard(tool: TimelineTool) {
                     )
                 }
             }
+        }
+    }
+}
+
+/** 统一 diff 着色：+ 绿 / − 红 / @@ 界标灰（cap 200 行防爆量）。 */
+@Composable
+private fun DiffView(diff: String) {
+    val add = MaterialTheme.colorScheme.primary
+    val del = MaterialTheme.colorScheme.error
+    val meta = MaterialTheme.colorScheme.onSurfaceVariant
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(8.dp),
+    ) {
+        diff.lines().take(200).forEach { line ->
+            val color = when {
+                line.startsWith("+++") || line.startsWith("---") -> meta
+                line.startsWith("+") -> add
+                line.startsWith("-") -> del
+                line.startsWith("@@") -> meta
+                else -> MaterialTheme.colorScheme.onSurface
+            }
+            Text(
+                line,
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+                color = color,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }

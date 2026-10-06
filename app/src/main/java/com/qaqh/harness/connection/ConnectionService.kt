@@ -285,8 +285,10 @@ class ConnectionService : Service() {
     companion object {
         private const val CHANNEL_STATUS = "connection"
         private const val CHANNEL_APPROVALS = "approvals"
+        private const val CHANNEL_TODO = "todo"
         private const val NOTIFICATION_ID = 1
         private const val APPROVAL_NOTIFICATION_BASE = 1000
+        private const val TODO_NOTIFICATION_ID = 2
 
         private val _connectionState = MutableStateFlow<RingingConnection.State>(RingingConnection.State.Disconnected)
         val connectionState: StateFlow<RingingConnection.State> = _connectionState.asStateFlow()
@@ -343,6 +345,63 @@ class ConnectionService : Service() {
 
         private val _lastRespondError = MutableStateFlow<String?>(null)
         val lastRespondError: StateFlow<String?> = _lastRespondError.asStateFlow()
+
+        /**
+         * 待办实况通知（聊天屏收集到 todo 变化时调用）：
+         * API 36+ 用 Live Update ProgressStyle（N/M 完成进度条），低版本回退普通进度条。
+         * 全部完成即取消；退出聊天屏后保留最后状态（SSE 只在屏内订阅，不会继续更新）。
+         */
+        fun updateTodoNotification(context: Context, todo: com.qaqh.harness.data.ringing.model.TodoState) {
+            val nm = context.getSystemService(NotificationManager::class.java)
+            if (todo.allDone) {
+                nm.cancel(TODO_NOTIFICATION_ID)
+                return
+            }
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL_TODO, "待办进度", NotificationManager.IMPORTANCE_LOW)
+            )
+            val pct = if (todo.total > 0) (todo.completed * 100) / todo.total else 0
+            val current = todo.inProgress
+                ?: todo.ordered().firstOrNull { it.status == com.qaqh.harness.data.ringing.model.TodoStatus.PENDING }
+            val deepLink = PendingIntent.getActivity(
+                context,
+                0,
+                Intent(context, MainActivity::class.java).setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            val title = "待办 ${todo.completed}/${todo.total}"
+            val text = current?.let { "进行中：${it.title}" } ?: "等待开始"
+            val notification = if (android.os.Build.VERSION.SDK_INT >= 36) {
+                Notification.Builder(context, CHANNEL_TODO)
+                    .setStyle(
+                        android.app.Notification.ProgressStyle()
+                            .addProgressSegment(
+                                android.app.Notification.ProgressStyle.Segment(100).setColor(0xFF4F46E5.toInt())
+                            )
+                            .setProgress(pct)
+                    )
+                    .setContentTitle(title)
+                    .setContentText(text)
+                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setContentIntent(deepLink)
+                    .setOngoing(true)
+                    .build()
+            } else {
+                NotificationCompat.Builder(context, CHANNEL_TODO)
+                    .setProgress(100, pct, false)
+                    .setContentTitle(title)
+                    .setContentText(text)
+                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setContentIntent(deepLink)
+                    .setOngoing(true)
+                    .build()
+            }
+            nm.notify(TODO_NOTIFICATION_ID, notification)
+        }
+
+        fun cancelTodoNotification(context: Context) {
+            context.getSystemService(NotificationManager::class.java).cancel(TODO_NOTIFICATION_ID)
+        }
 
         /** 设备凭据被 daemon 拒绝（吊销/token 轮换）：UI 消费后应掉回配对屏。 */
         private val _authRevoked = MutableStateFlow(false)

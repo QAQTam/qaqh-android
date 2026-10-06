@@ -37,6 +37,10 @@ class SessionTimeline(
     private val _status = MutableStateFlow<Status>(Status.Idle)
     val status: StateFlow<Status> = _status.asStateFlow()
 
+    /** 当前待办清单（来自 todo_write/todo_update 工具块的 args_json；null = 本会话无待办）。 */
+    private val _todos = MutableStateFlow<com.qaqh.harness.data.ringing.model.TodoState?>(null)
+    val todos: StateFlow<com.qaqh.harness.data.ringing.model.TodoState?> = _todos.asStateFlow()
+
     sealed interface Status {
         data object Idle : Status
         data object Loading : Status
@@ -215,6 +219,7 @@ class SessionTimeline(
             .distinctBy { it.turnId }
             .sortedBy { it.turnIndex }
         lastSeq = maxOf(lastSeq ?: 0L, resp.snapshot.watermark)
+        rebuildTodos()
         oldestIndex = _turns.value.firstOrNull()?.turnIndex
         if (!resp.hasMore) {
             endReached = true
@@ -251,6 +256,27 @@ class SessionTimeline(
             .distinctBy { it.turnId }
             .sortedBy { it.turnIndex }
         lastSeq = maxOf(lastSeq ?: 0L, resp.snapshot.watermark)
+        rebuildTodos()
+    }
+
+    /** 分页/刷新后按时间序重放 todo 工具块，重建待办清单（冷进会话也能拿到当前状态）。 */
+    private fun rebuildTodos() {
+        var state: com.qaqh.harness.data.ringing.model.TodoState? = null
+        _turns.value.sortedBy { it.turnIndex }.forEach { turn ->
+            turn.rounds.forEach { round ->
+                round.blocks.forEach { block ->
+                    val tool = block.tool ?: return@forEach
+                    if (!com.qaqh.harness.data.ringing.model.TodoState.isTodoTool(tool.name)) return@forEach
+                    state = when (tool.name?.lowercase()) {
+                        "todo_update" -> state?.let {
+                            com.qaqh.harness.data.ringing.model.TodoState.parseUpdate(tool.argsJson, it)
+                        } ?: state
+                        else -> com.qaqh.harness.data.ringing.model.TodoState.parseWrite(tool.argsJson, state) ?: state
+                    }
+                }
+            }
+        }
+        _todos.value = state
     }
 
     private suspend fun awaitLease(): String =
@@ -356,6 +382,22 @@ class SessionTimeline(
             }
 
             else -> _turns.value
+        }
+
+        // todo 工具块 → 待办清单（write 整表替换 / update 单条 delta；畸形忽略）
+        val tool = when (type) {
+            "block_opened" -> nestedBlock()?.get("tool")?.let { decodeTool(it) }
+            "tool_updated" -> data["tool"]?.let { decodeTool(it) }
+            else -> null
+        }
+        if (tool != null && com.qaqh.harness.data.ringing.model.TodoState.isTodoTool(tool.name)) {
+            val next = when (tool.name?.lowercase()) {
+                "todo_update" -> _todos.value?.let {
+                    com.qaqh.harness.data.ringing.model.TodoState.parseUpdate(tool.argsJson, it)
+                }
+                else -> com.qaqh.harness.data.ringing.model.TodoState.parseWrite(tool.argsJson, _todos.value)
+            }
+            next?.let { _todos.value = it }
         }
     }
 
