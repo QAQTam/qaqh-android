@@ -21,6 +21,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -108,17 +109,20 @@ class ConnectionService : Service() {
     private suspend fun sessionDiscoveryLoop(conn: RingingConnection) {
         var currentSessionId: String? = null
         while (scope.isActive) {
-            delay(15_000)
+            // 先等连接就绪、立刻首拉，再进周期：冷启动列表 ~1-2s 可见
+            //（原实现先 delay(15s)，Home 的 refreshNow 又因未连接空手而归，列表空等 15s）
+            conn.state.first { it is RingingConnection.State.Connected }
             val sessions = refreshSessions(conn)
-            if (sessions.isEmpty()) continue
-            val target = sessions.firstOrNull { it.running }
-                ?: sessions.maxByOrNull { it.updatedAt }
-                ?: continue
-            if (target.sessionId != currentSessionId) {
-                currentSessionId = target.sessionId
-                _sessionInfo.value = target
-                conn.setSessionId(target.sessionId)
+            if (sessions.isNotEmpty()) {
+                val target = sessions.firstOrNull { it.running }
+                    ?: sessions.maxByOrNull { it.updatedAt }
+                if (target != null && target.sessionId != currentSessionId) {
+                    currentSessionId = target.sessionId
+                    _sessionInfo.value = target
+                    conn.setSessionId(target.sessionId)
+                }
             }
+            delay(15_000)
         }
     }
 
@@ -299,10 +303,15 @@ class ConnectionService : Service() {
         private val _sessions = MutableStateFlow<List<com.qaqh.harness.data.ringing.model.SessionListEntry>>(emptyList())
         val sessions: StateFlow<List<com.qaqh.harness.data.ringing.model.SessionListEntry>> = _sessions.asStateFlow()
 
-        /** 立即刷新会话列表（进入列表屏/下拉刷新时调用）。 */
+        /** 立即刷新会话列表（进入列表屏/下拉刷新时调用）；未连接时等连接就绪后再拉（最多等 10s）。 */
         fun refreshNow(scope: kotlinx.coroutines.CoroutineScope) {
             val conn = connection ?: return
-            scope.launch { refreshSessions(conn) }
+            scope.launch {
+                if (withTimeoutOrNull(10_000) { conn.state.first { it is RingingConnection.State.Connected } } == null) {
+                    return@launch
+                }
+                refreshSessions(conn)
+            }
         }
 
         private suspend fun refreshSessions(conn: RingingConnection): List<com.qaqh.harness.data.ringing.model.SessionListEntry> {
