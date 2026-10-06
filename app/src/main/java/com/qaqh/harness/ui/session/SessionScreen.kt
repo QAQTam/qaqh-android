@@ -408,10 +408,6 @@ private fun TurnItem(turn: TimelineTurn) {
     val blocks = remember(turn) { turn.rounds.flatMap { it.blocks } }
     // 过程块（思考+工具）vs 内容块（正文/通知）——Qoder 式折叠的对象
     val processBlocks = blocks.filter { it.kind == "reasoning" || (it.kind == "tool" && it.tool != null) }
-    val runningTool = processBlocks.lastOrNull {
-        it.kind == "tool" && (it.tool?.state == "running" || it.tool?.state == "prepared")
-    }
-    val openReasoning = processBlocks.lastOrNull { it.kind == "reasoning" && it.state == "open" }
 
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         turn.userText?.takeIf { it.isNotBlank() }?.let { userText ->
@@ -442,23 +438,11 @@ private fun TurnItem(turn: TimelineTurn) {
                 }
             }
         } else {
-            // 回合进行中：已完成过程（工具+已收束思考）聚合一行 + 当前思考卡 + 运行中工具单行
-            val doneProcess = processBlocks.filter { it != runningTool && it != openReasoning }
-            if (doneProcess.isNotEmpty()) {
-                val show = remember { mutableStateOf(false) }
-                ProcessChip(
-                    label = "已运行工具",
-                    subtitle = processSummary(doneProcess),
-                    stepCount = doneProcess.size,
-                    failed = doneProcess.any { it.tool?.state == "failed" },
-                    onClick = { show.value = true },
-                )
-                if (show.value) {
-                    ProcessSheet(doneProcess) { show.value = false }
-                }
+            // 回合进行中：过程全部按序展开（思考卡 3 行尾 + 工具卡带实时状态/预览），
+            // sealed 后上面的分支自动接管、整体收缩为聚合芯片
+            processBlocks.forEach { block ->
+                if (block.kind == "reasoning") ReasoningItem(block) else block.tool?.let { ToolCard(it) }
             }
-            openReasoning?.let { ReasoningItem(it) }
-            runningTool?.let { RunningToolChip(it) }
         }
 
         blocks.forEach { block ->
@@ -549,33 +533,6 @@ private fun ProcessChip(
                 Spacer(Modifier.weight(1f))
             }
         }
-    }
-}
-
-/** 运行中工具单行芯片：转圈 + 动词头部，无正文。 */
-@Composable
-private fun RunningToolChip(block: TimelineBlock) {
-    val tool = block.tool ?: return
-    val head = remember(tool) { ToolFormatter.header(tool) }
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(vertical = 2.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(BlockSpacing),
-    ) {
-        CircularProgressIndicator(Modifier.size(10.dp), strokeWidth = 1.5.dp)
-        Text(
-            buildString {
-                append(head.verb)
-                head.rest?.takeIf { it.isNotBlank() }?.let { append(' '); append(it) }
-            },
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
     }
 }
 
