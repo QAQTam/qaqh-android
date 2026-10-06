@@ -139,13 +139,16 @@ class RingingApi(
                 .build()
         )
 
-    /** GET /sessions/{session_id}/timeline/events — 聊天实时增量（event: timeline.entry / ringing.stream_terminated）。 */
-    fun timelineEvents(clientSessionId: String, sessionId: String): Flow<TimelineSseEvent> = callbackFlow {
+    /** GET /sessions/{session_id}/timeline/events — 聊天实时增量（event: timeline.entry / ringing.stream_terminated）。
+     *  [lastEventId] 传 `{epoch}:timeline:{seq}`（Last-Event-ID）：服务端只回放该 seq 之后的尾巴；
+     *  不传则全量回放整个会话历史（900+ 帧/次，重连风暴时的卡顿根源）。 */
+    fun timelineEvents(clientSessionId: String, sessionId: String, lastEventId: String? = null): Flow<TimelineSseEvent> = callbackFlow {
         val url = (baseUrl + RingingProtocol.BASE_PATH + "/sessions/$sessionId/timeline/events").toHttpUrl()
         val request = Request.Builder().url(url)
             .header("Authorization", "Bearer $token")
             .header("X-QAQH-Client-Session-Id", clientSessionId)
             .header("Accept", "text/event-stream")
+            .apply { if (!lastEventId.isNullOrBlank()) header("Last-Event-ID", lastEventId) }
             .build()
         lateinit var source: EventSource
         source = EventSources.createFactory(sseHttp).newEventSource(request, object : EventSourceListener() {

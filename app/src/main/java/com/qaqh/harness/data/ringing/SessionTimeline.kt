@@ -51,6 +51,13 @@ class SessionTimeline(
     private var eventsJob: Job? = null
     private var endReached = false
 
+    /**
+     * 已消费的最大 timeline_seq（REST 页用 snapshot.watermark、SSE 帧用逐帧 seq 推进）。
+     * 重订阅时作为 `Last-Event-ID: {epoch}:timeline:{seq}` 游标传给服务端——只补尾巴，
+     * 不再全量回放（对齐 webui qaqh-client timeline.rs 的行为）。
+     */
+    private var lastSeq: Long? = null
+
     /** 首屏加载 + 订阅实时增量。 */
     fun start(onError: (String) -> Unit) {
         if (eventsJob != null) return
@@ -65,17 +72,37 @@ class SessionTimeline(
                     // 服务端逐帧静默丢弃（sse.rs should_deliver_timeline_live）。
                     while (isActive) {
                         val sid = connection.leases.first()
-                        android.util.Log.i(TAG, "timeline SSE subscribe lease=${sid.take(8)} session=${sessionId.take(12)}")
+                        // 游标 = 当前 epoch + 已消费水位：epoch 变了（daemon 重启）服务端会
+                        // 自动退回全量回放（reducer 幂等），正常重连只补尾巴
+                        val epoch = (connection.state.value as? RingingConnection.State.Connected)?.serverEpoch
+                        val cursor = if (epoch != null && lastSeq != null) "$epoch:timeline:$lastSeq" else null
+                        android.util.Log.i(
+                            TAG,
+                            "timeline SSE subscribe lease=${sid.take(8)} session=${sessionId.take(12)} " +
+                                "cursor=${if (cursor != null) "seq=$lastSeq" else "none(full replay)"}",
+                        )
                         try {
                             var frames = 0
                             coroutineScope {
-                                // 等待下一次租约轮换；一旦轮换即取消当前 SSE（立即用新租约重订阅）
+                                // 空闲看门狗：服务端每 15s 发 keepalive 注释（OkHttp 监听器看不到），
+                                // 正常流式期间帧间隔远小于此。长时间零帧说明流已半开/黑洞
+                                // （网络切换、代理回收），带游标重订阅快速恢复。
+                                var lastFrameAt = System.nanoTime()
+                                val watchdog = launch {
+                                    while (true) {
+                                        delay(5_000)
+                                        if (System.nanoTime() - lastFrameAt > IDLE_TIMEOUT_MS * 1_000_000) {
+                                            throw StreamIdle
+                                        }
+                                    }
+                                }
                                 val leaseWaiter = launch {
                                     connection.leases.drop(1).first()
                                     throw LeaseRotated
                                 }
                                 try {
-                                    connection.api.timelineEvents(sid, sessionId).collect { ev ->
+                                    connection.api.timelineEvents(sid, sessionId, cursor).collect { ev ->
+                                        lastFrameAt = System.nanoTime()
                                         frames++
                                         if (frames == 1 || frames % 100 == 0) {
                                             android.util.Log.i(TAG, "timeline SSE frames=$frames")
@@ -88,12 +115,16 @@ class SessionTimeline(
                                     }
                                 } finally {
                                     leaseWaiter.cancel()
+                                    watchdog.cancel()
                                 }
                             }
                             android.util.Log.i(TAG, "timeline SSE flow completed after $frames frames")
                         } catch (e: LeaseRotated) {
                             // 拿新租约立即重订阅
                             continue
+                        } catch (e: StreamIdle) {
+                            android.util.Log.w(TAG, "timeline SSE idle ${IDLE_TIMEOUT_MS}ms — resubscribe with cursor")
+                            delay(1_000)
                         } catch (e: RingingApi.ApiException) {
                             android.util.Log.w(TAG, "timeline SSE ApiException ${e.httpStatus} ${e.code}")
                             if (e.httpStatus != 401) throw e
@@ -111,6 +142,14 @@ class SessionTimeline(
     }
 
     private object LeaseRotated : Exception("lease rotated")
+    private object StreamIdle : Exception("stream idle")
+
+    private companion object {
+        const val TAG = "SessionTimeline"
+
+        /** 无帧判定为死流的阈值；服务端 15s keepalive 只保管道，帧级空闲超过它即重订阅。 */
+        const val IDLE_TIMEOUT_MS = 60_000L
+    }
 
     fun stop() {
         eventsJob?.cancel()
@@ -166,6 +205,7 @@ class SessionTimeline(
         _turns.value = (resp.snapshot.turns + _turns.value)
             .distinctBy { it.turnId }
             .sortedBy { it.turnIndex }
+        lastSeq = maxOf(lastSeq ?: 0L, resp.snapshot.watermark)
         oldestIndex = _turns.value.firstOrNull()?.turnIndex
         if (!resp.hasMore) {
             endReached = true
@@ -201,6 +241,7 @@ class SessionTimeline(
         _turns.value = (resp.snapshot.turns + _turns.value)
             .distinctBy { it.turnId }
             .sortedBy { it.turnIndex }
+        lastSeq = maxOf(lastSeq ?: 0L, resp.snapshot.watermark)
     }
 
     private suspend fun awaitLease(): String =
@@ -217,6 +258,7 @@ class SessionTimeline(
     // - tool_progress：chunk 追加到工具输出。
 
     private fun applyFrame(frame: TimelineEntryFrame) {
+        lastSeq = maxOf(lastSeq ?: 0L, frame.timelineSeq)
         val type = frame.type ?: return
         val data = frame.event as? JsonObject ?: return
         fun str(key: String): String? = (data[key] as? JsonPrimitive)?.content
