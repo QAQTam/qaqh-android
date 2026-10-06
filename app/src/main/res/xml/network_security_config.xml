@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 正式链路是 https + SPKI pinning（见 data/pairing/TlsPinning.kt），默认禁明文。
+     debug 变体覆盖本文件放开明文，供 LAN Direct 手输配对联调用。 -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

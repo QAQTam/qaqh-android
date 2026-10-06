@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- debug 构建放开明文：Direct 手输配对（地址+token+TLS 指纹）在 dev 环境仍可能走
+     http://<lan-ip>，正式 release 构建回到 main 的全禁明文配置。 -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

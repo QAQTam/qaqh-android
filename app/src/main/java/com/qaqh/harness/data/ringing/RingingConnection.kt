@@ -253,12 +253,20 @@ class RingingConnection(
             clientSessionId = open.clientSessionId
             serverEpoch = open.serverEpoch
         }
-        // attach 要在 Connected 置位前完成：timeline/content 等 attach 门控接口依赖它
+        // attach 要在 Connected/bootstrap 前完成：timeline/content 等 attach 门控接口依赖它，
+        // device 身份下 bootstrap 本身也要求先 attach（否则 401 lease_required）。失败不吞——
+        // 带着未 attach 的租约只会撞 401/403，这里直接判本轮周期失败走退避重试。
         val knownSessionId = mutex.withLock { sessionId }
         if (knownSessionId != null) {
-            runCatching { postCommand(RingingProtocol.CHANNEL_CONTROL, CommandEnvelope.sessionAttach(knownSessionId)) }
-                .onSuccess { android.util.Log.i(TAG, "attach ok lease=${open.clientSessionId.take(8)} session=${knownSessionId.take(12)} ack=${it.status} ${it.code ?: ""}") }
-                .onFailure { android.util.Log.w(TAG, "attach FAILED: $it") }
+            val ack = postCommand(RingingProtocol.CHANNEL_CONTROL, CommandEnvelope.sessionAttach(knownSessionId))
+            if (ack.status == "rejected") {
+                throw RingingApi.ApiException(
+                    httpStatus = 0,
+                    code = ack.code,
+                    message = "attach rejected: ${ack.message ?: ack.code ?: "unknown"}",
+                )
+            }
+            android.util.Log.i(TAG, "attach ok lease=${open.clientSessionId.take(8)} session=${knownSessionId.take(12)} ack=${ack.status} ${ack.code ?: ""}")
         }
         mutex.withLock { _state.value = State.Connected(open.serverEpoch, open.clientSessionId) }
         _leases.tryEmit(open.clientSessionId)
@@ -303,8 +311,8 @@ class RingingConnection(
                 serverEpoch = boot.serverEpoch
                 cursor = boot.snapshotCursor
             }
-            // attach 只读归属：/content 与后续 owns_session 校验的前提（M0 后成为硬要求）
-            runCatching { postCommand(RingingProtocol.CHANNEL_CONTROL, CommandEnvelope.sessionAttach(sessionId)) }
+            // attach 已在 connectOnce 完成且失败即中断（时序：open → attach → bootstrap → SSE），
+            // 这里不再重复发——重复 attach 白耗一个命令回合且掩盖时序问题
             // bootstrap 快照自带当前活动状态，先投影一次（后续靠 SSE activity 增量更新）
             boot.activity?.let { _events.tryEmit(SessionEvent.Activity(it, null)) }
             // 快照里已挂起的交互也要投影（重连/后加入的客户端靠它看到积压请求）
