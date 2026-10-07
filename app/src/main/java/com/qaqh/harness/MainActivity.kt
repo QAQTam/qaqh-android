@@ -9,10 +9,16 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.PredictiveBackHandler
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -181,11 +187,20 @@ fun AppRoot(modifier: Modifier = Modifier) {
                 }
             },
         ) {
-            TabShell(creds, onUnpair = {
-                ConnectionService.stop(context)
-                store.clear()
-                credentials = null
-            }, onOpenSession = { openSessionId = it })
+        fun openChat(id: String) {
+            // 进场：先置进度再上屏（防首帧闪全开），滑入 = 预测返回滑出的逆过程
+            scope.launch {
+                chatProgress.snapTo(1f)
+                openSessionId = id
+                chatProgress.animateTo(0f, tween(280, easing = FastOutSlowInEasing))
+            }
+        }
+
+        TabShell(creds, onUnpair = {
+            ConnectionService.stop(context)
+            store.clear()
+            credentials = null
+        }, onOpenSession = ::openChat)
         }
 
         openSessionId?.let { id ->
@@ -209,7 +224,7 @@ fun AppRoot(modifier: Modifier = Modifier) {
                     sessionId = id,
                     onBack = {
                         scope.launch {
-                            chatProgress.animateTo(1f, tween(200))
+                            chatProgress.animateTo(1f, tween(220, easing = FastOutSlowInEasing))
                             openSessionId = null
                             chatProgress.snapTo(0f)
                         }
@@ -275,19 +290,30 @@ private fun TabShell(
                 .windowInsetsPadding(WindowInsets.statusBars)
                 .hazeSource(hazeState),
         ) {
-            when (tab) {
-                0 -> HomeScreen(
-                    credentials = credentials,
-                    onOpenSession = onOpenSession,
-                    modifier = Modifier.fillMaxSize(),
-                )
-                1 -> com.qaqh.harness.ui.approvals.ApprovalsScreen(Modifier.fillMaxSize())
-                2 -> com.qaqh.harness.ui.tools.ToolsScreen(Modifier.fillMaxSize())
-                else -> com.qaqh.harness.ui.settings.SettingsScreen(
-                    credentials = credentials,
-                    onUnpair = onUnpair,
-                    modifier = Modifier.fillMaxSize(),
-                )
+            // tab 切换：轻量淡入 + 微缩放（不滑动，避免与透镜动画抢戏）
+            AnimatedContent(
+                targetState = tab,
+                transitionSpec = {
+                    (fadeIn(tween(180, easing = FastOutSlowInEasing)) +
+                        scaleIn(initialScale = 0.985f, animationSpec = tween(180, easing = FastOutSlowInEasing)))
+                        .togetherWith(fadeOut(tween(110)))
+                },
+                label = "tab-content",
+            ) { t ->
+                when (t) {
+                    0 -> HomeScreen(
+                        credentials = credentials,
+                        onOpenSession = onOpenSession,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                    1 -> com.qaqh.harness.ui.approvals.ApprovalsScreen(Modifier.fillMaxSize())
+                    2 -> com.qaqh.harness.ui.tools.ToolsScreen(Modifier.fillMaxSize())
+                    else -> com.qaqh.harness.ui.settings.SettingsScreen(
+                        credentials = credentials,
+                        onUnpair = onUnpair,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
             }
         }
         com.qaqh.harness.ui.nav.GlassNavBar(
