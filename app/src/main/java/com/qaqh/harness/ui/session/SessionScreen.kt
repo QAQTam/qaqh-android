@@ -161,10 +161,8 @@ fun SessionScreen(
         }
     }
 
-    // 待办 → 实况通知（SSE 只在屏内流动，由屏驱动通知更新）
-    LaunchedEffect(todos) {
-        todos?.let { ConnectionService.updateTodoNotification(context, it) }
-    }
+    // 待办通知已改为 ConnectionService 全局跟踪器驱动（离开聊天屏仍更新/上胶囊），
+    // 聊天屏内只保留一行入口 chip
 
     // 底部 inset 取 nav bar 与键盘的较大者；顶部让出状态栏（聊天屏全屏覆盖 tab 壳，无 Scaffold 提供 padding）
     Column(
@@ -192,7 +190,7 @@ fun SessionScreen(
             }
             Column(Modifier.weight(1f)) {
                 Text(
-                    entry?.lastSummary?.takeIf { it.isNotBlank() } ?: "会话 ${sessionId.take(8)}…",
+                    entry?.displayTitle?.takeIf { it.isNotBlank() } ?: "会话 ${sessionId.take(8)}…",
                     style = MaterialTheme.typography.titleMedium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -223,9 +221,15 @@ fun SessionScreen(
             }
         }
 
-        // 待办清单（进行中→待办→已完成；全部完成自动隐藏）
+        // 待办：一行进度 chip（胶囊通知做常驻 surface，聊天区不再嵌大面板）；点开看完整清单
         todos?.takeIf { !it.allDone }?.let { todo ->
-            TodoPanel(todo, Modifier.padding(horizontal = ScreenPadding))
+            var showTodoSheet by remember { mutableStateOf(false) }
+            TodoChip(todo, Modifier.padding(horizontal = ScreenPadding)) { showTodoSheet = true }
+            if (showTodoSheet) {
+                ModalBottomSheet(onDismissRequest = { showTodoSheet = false }) {
+                    TodoPanel(todo, Modifier.padding(horizontal = ScreenPadding).padding(bottom = 24.dp))
+                }
+            }
         }
 
         // 聊天区
@@ -314,6 +318,37 @@ fun SessionScreen(
 /** 流式期只渲染尾部：封顶单次重排版成本（sealed 后由 Markdown 渲染全文）。 */
 private fun streamTail(text: String, max: Int = 1_200): String =
     if (text.length <= max + 300) text else "…" + text.takeLast(max)
+
+/**
+ * 待办入口 chip：单行进度摘要（N/M + 进行中条目），点击弹出完整清单（TodoPanel）。
+ * 常驻进度呈现已移交通知胶囊（Live Updates），聊天区只留轻量入口。
+ */
+@Composable
+private fun TodoChip(
+    todo: com.qaqh.harness.data.ringing.model.TodoState,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val current = todo.inProgress
+    AssistChip(
+        onClick = onClick,
+        modifier = modifier,
+        label = {
+            Text(
+                buildString {
+                    append("待办 ${todo.completed}/${todo.total}")
+                    current?.let { append(" · ").append(it.title.ifBlank { it.id }) }
+                },
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        leadingIcon = {
+            Text("☑", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+        },
+    )
+}
 
 /**
  * 待办清单面板：进行中→待办→已完成排序，折叠预览 3 行；全部完成时整个隐藏（调用方保证）。

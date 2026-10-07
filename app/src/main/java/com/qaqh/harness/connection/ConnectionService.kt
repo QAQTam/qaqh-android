@@ -8,11 +8,19 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.os.IBinder
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationCompat.ProgressStyle
 import com.qaqh.harness.MainActivity
+import com.qaqh.harness.R
 import com.qaqh.harness.data.pairing.CredentialStore
 import com.qaqh.harness.data.pairing.pinnedHttpClient
 import com.qaqh.harness.data.ringing.RingingConnection
+import com.qaqh.harness.data.ringing.model.TodoState
+import com.qaqh.harness.data.ringing.model.ApprovalChallenge
+import com.qaqh.harness.data.ringing.model.ApprovalDecisions
+import com.qaqh.harness.data.ringing.model.InteractionKinds
+import com.qaqh.harness.data.ringing.model.TodoStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,6 +34,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.decodeFromJsonElement
 
 /** 当前待审批（v2 interaction_requested, kind=permission）投影。 */
 data class PendingApproval(
@@ -61,6 +72,8 @@ class ConnectionService : Service() {
             stopSelf()
             return
         }
+        Companion.deviceScope = creds?.scope
+        Companion.running = this
         val conn = RingingConnection(
             endpoint = creds.baseUrl,
             token = creds.token,
@@ -100,6 +113,7 @@ class ConnectionService : Service() {
             }
         }
         scope.launch { sessionDiscoveryLoop(conn) }
+        scope.launch { todoTrackerLoop(conn) }
         conn.start()
     }
 
@@ -107,6 +121,7 @@ class ConnectionService : Service() {
         scope.cancel()
         connection = null
         Companion.connection = null
+        Companion.running = null
         _connectionState.value = RingingConnection.State.Disconnected
         _activity.value = null
         _pendingApprovals.value = emptyList()
@@ -122,7 +137,8 @@ class ConnectionService : Service() {
             conn.state.first { it is RingingConnection.State.Connected }
             val sessions = refreshSessions(conn)
             if (sessions.isNotEmpty()) {
-                val target = sessions.firstOrNull { it.running }
+                // runStatus 兼容新旧两代 daemon（backend-fix 后 running:bool → status 词表）
+                val target = sessions.firstOrNull { it.isWorking }
                     ?: sessions.maxByOrNull { it.updatedAt }
                 if (target != null && target.sessionId != currentSessionId) {
                     currentSessionId = target.sessionId
@@ -130,12 +146,91 @@ class ConnectionService : Service() {
                     conn.setSessionId(target.sessionId)
                 }
             }
+            // device 身份：待审批整体以 challenge 快照为准，每轮顺带刷新
+            //（challenge_id 按 (kind, session, source) 去重签发，跨刷新稳定）
+            if (deviceScope != null) {
+                currentSessionId?.let { refreshChallenges(conn, it) }
+            }
             delay(15_000)
         }
     }
 
-    private suspend fun handleEvent(event: RingingConnection.SessionEvent) {
-        when (event) {
+    /**
+     * 待办全局跟踪器：常驻 timeline SSE（服务端 hub 是 broadcast，同租约多连接各自收帧，
+     * 与聊天屏的 SessionTimeline 互不影响）。每租约/换会话/daemon 重启（epoch 变）后首订
+     * 全量回放重建 todo 状态，其后带 `{epoch}:timeline:{seq}` 游标只补尾巴。
+     */
+    private suspend fun todoTrackerLoop(conn: RingingConnection) {
+        var lastSeq: Long? = null
+        var trackedEpoch: String? = null
+        var trackedSession: String? = null
+        var todoState: TodoState? = null
+        var backoffMs = 1_000L
+        while (scope.isActive) {
+            val sid = conn.leases.first()
+            val sessionId = conn.currentSessionId() ?: run { delay(1_000); continue }
+            val epoch = (conn.state.value as? RingingConnection.State.Connected)?.serverEpoch
+            if (sessionId != trackedSession) {
+                trackedSession = sessionId
+                todoState = null
+                lastSeq = null
+            }
+            val cursor = if (epoch != null && epoch == trackedEpoch && lastSeq != null) {
+                "$epoch:timeline:$lastSeq"
+            } else {
+                null // epoch 变了或首订：全量回放重建
+            }
+            trackedEpoch = epoch
+            var frames = 0
+            try {
+                conn.api.timelineEvents(sid, sessionId, cursor).collect { ev ->
+                    when (ev) {
+                        is com.qaqh.harness.data.ringing.RingingApi.TimelineSseEvent.Entry -> {
+                            frames++
+                            if (frames == 1) backoffMs = 1_000L // 流恢复，退避归位
+                            lastSeq = maxOf(lastSeq ?: 0L, ev.frame.timelineSeq)
+                            val next = ingestTodoFrame(conn, todoState, ev.frame)
+                            if (next !== todoState) {
+                                todoState = next
+                                notifyTodo(this@ConnectionService, next)
+                            }
+                        }
+                        com.qaqh.harness.data.ringing.RingingApi.TimelineSseEvent.Terminated -> Unit
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: com.qaqh.harness.data.ringing.RingingApi.ApiException) {
+                android.util.Log.w(TAG, "todo tracker SSE ${e.httpStatus} ${e.code}")
+            }
+            delay(backoffMs)
+            backoffMs = minOf(backoffMs * 2, 30_000L)
+        }
+    }
+
+    /** 从 timeline 帧摄取 todo 工具块（block_opened 内嵌 tool / tool_updated 顶层 tool）。 */
+    private fun ingestTodoFrame(
+        conn: RingingConnection,
+        state: TodoState?,
+        frame: com.qaqh.harness.data.ringing.model.TimelineEntryFrame,
+    ): TodoState? {
+        val type = frame.type ?: return state
+        val data = frame.event as? JsonObject ?: return state
+        val toolElement = when (type) {
+            "block_opened" -> (data["block"] as? JsonObject)?.get("tool")
+            "tool_updated" -> data["tool"]
+            else -> null
+        } ?: return state
+        val tool = runCatching {
+            conn.api.json.decodeFromJsonElement(
+                com.qaqh.harness.data.ringing.model.TimelineTool.serializer(),
+                toolElement,
+            )
+        }.getOrNull() ?: return state
+        return TodoState.ingestTool(state, tool.name, tool.argsJson)
+    }
+
+    private suspend fun handleEvent(event: RingingConnection.SessionEvent) {        when (event) {
             is RingingConnection.SessionEvent.Activity -> {
                 _activity.value = event.state
                 notifyStatus(
@@ -149,6 +244,11 @@ class ConnectionService : Service() {
             }
 
             is RingingConnection.SessionEvent.InteractionRequested -> {
+                if (deviceScope != null) {
+                    // device 身份：canonical id 不出 daemon，SSE 只作立即刷新触发器
+                    refreshChallengesNow()
+                    return
+                }
                 val r = event.requested
                 val approval = PendingApproval(
                     interactionId = r.interactionId,
@@ -162,17 +262,32 @@ class ConnectionService : Service() {
             }
 
             is RingingConnection.SessionEvent.InteractionResolved -> {
+                if (deviceScope != null) {
+                    refreshChallengesNow()
+                    return
+                }
                 cancelApprovalCountdown(event.resolved.interactionId)
                 _pendingApprovals.value =
                     _pendingApprovals.value.filterNot { it.interactionId == event.resolved.interactionId }
             }
 
             is RingingConnection.SessionEvent.InteractionExpired -> {
+                if (deviceScope != null) {
+                    refreshChallengesNow()
+                    return
+                }
                 cancelApprovalCountdown(event.interactionId)
                 _pendingApprovals.value =
                     _pendingApprovals.value.filterNot { it.interactionId == event.interactionId }
             }
         }
+    }
+
+    /** SSE 交互事件在 device 身份下的统一动作：立即拉 challenge 快照刷新列表。 */
+    private suspend fun refreshChallengesNow() {
+        val conn = connection ?: return
+        val sid = conn.currentSessionId() ?: return
+        refreshChallenges(conn, sid)
     }
 
     private val summaryJson = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
@@ -310,6 +425,10 @@ class ConnectionService : Service() {
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_APPROVALS, "审批请求", NotificationManager.IMPORTANCE_HIGH)
         )
+        // 实时活动胶囊要求 channel importance 非 MIN/LOW（Google 示例用 DEFAULT）
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_TODO, "待办进度", NotificationManager.IMPORTANCE_DEFAULT)
+        )
     }
 
     companion object {
@@ -371,6 +490,13 @@ class ConnectionService : Service() {
         @Volatile
         private var connection: RingingConnection? = null
 
+        @Volatile
+        private var running: ConnectionService? = null
+
+        /** /pair 签发的 scope（非 null 即 device 身份，扫码配对得来）：审批走 challenge 流。 */
+        @Volatile
+        private var deviceScope: String? = null
+
         /** 会话屏直接借用当前连接（timeline/发消息）；未连接返回 null。 */
         fun activeConnection(): RingingConnection? = connection
 
@@ -378,61 +504,72 @@ class ConnectionService : Service() {
         val lastRespondError: StateFlow<String?> = _lastRespondError.asStateFlow()
 
         /**
-         * 待办实况通知（聊天屏收集到 todo 变化时调用）：
-         * API 36+ 用 Live Update ProgressStyle（N/M 完成进度条），低版本回退普通进度条。
-         * 全部完成即取消；退出聊天屏后保留最后状态（SSE 只在屏内订阅，不会继续更新）。
+         * 待办实况通知（Android 16 Live Updates / ColorOS 16 流体云胶囊）。
+         * 由 [todoTrackerLoop] 全局驱动（不再依赖聊天屏打开）：
+         * - NotificationCompat + setRequestPromotedOngoing(true) 请求胶囊提升呈现
+         *   （前提：manifest 声明 POST_PROMOTED_NOTIFICATIONS + 用户在系统设置允许，
+         *   见 [promotedOngoingEnabled]；Google platform-samples live-updates 同款配方）
+         * - API 36+ 用 ProgressStyle 分段着色（已完成绿 / 剩余灰），setShortCriticalText
+         *   供胶囊收起态显示 N/M；低版本回退普通进度条
+         * - 全部完成/无待办即取消
          */
-        fun updateTodoNotification(context: Context, todo: com.qaqh.harness.data.ringing.model.TodoState) {
+        private fun notifyTodo(context: Context, todo: TodoState?) {
             val nm = context.getSystemService(NotificationManager::class.java)
-            if (todo.allDone) {
+            if (todo == null || todo.items.isEmpty() || todo.allDone) {
                 nm.cancel(TODO_NOTIFICATION_ID)
                 return
             }
-            nm.createNotificationChannel(
-                NotificationChannel(CHANNEL_TODO, "待办进度", NotificationManager.IMPORTANCE_LOW)
-            )
-            val pct = if (todo.total > 0) (todo.completed * 100) / todo.total else 0
-            val current = todo.inProgress
-                ?: todo.ordered().firstOrNull { it.status == com.qaqh.harness.data.ringing.model.TodoStatus.PENDING }
             val deepLink = PendingIntent.getActivity(
                 context,
                 0,
                 Intent(context, MainActivity::class.java).setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
-            val title = "待办 ${todo.completed}/${todo.total}"
-            val text = current?.let { "进行中：${it.title}" } ?: "等待开始"
-            val notification = if (android.os.Build.VERSION.SDK_INT >= 36) {
-                Notification.Builder(context, CHANNEL_TODO)
-                    .setStyle(
-                        android.app.Notification.ProgressStyle()
-                            .addProgressSegment(
-                                android.app.Notification.ProgressStyle.Segment(100).setColor(0xFF4F46E5.toInt())
-                            )
-                            .setProgress(pct)
-                    )
-                    .setContentTitle(title)
-                    .setContentText(text)
-                    .setSmallIcon(android.R.drawable.stat_sys_download)
-                    .setContentIntent(deepLink)
-                    .setOngoing(true)
-                    .build()
+            val pct = if (todo.total > 0) (todo.completed * 100) / todo.total else 0
+            val current = todo.inProgress
+                ?: todo.ordered().firstOrNull { it.status == TodoStatus.PENDING }
+            val builder = NotificationCompat.Builder(context, CHANNEL_TODO)
+                .setSmallIcon(R.drawable.ic_stat_todo)
+                .setOngoing(true)
+                .setRequestPromotedOngoing(true)
+                .setContentTitle("待办 ${todo.completed}/${todo.total}")
+                .setContentText(current?.let { "进行中：${it.title}" } ?: "等待开始")
+                .setShortCriticalText("${todo.completed}/${todo.total}")
+                .setContentIntent(deepLink)
+                .setOnlyAlertOnce(true)
+            if (android.os.Build.VERSION.SDK_INT >= 36) {
+                val segments = buildList {
+                    val done = (todo.completed * 100) / todo.total
+                    if (done > 0) add(ProgressStyle.Segment(done).setColor(0xFF188038.toInt()))
+                    if (done < 100) add(ProgressStyle.Segment(100 - done).setColor(0xFF3C4043.toInt()))
+                }
+                builder.setStyle(
+                    ProgressStyle()
+                        .setStyledByProgress(false)
+                        .setProgress(100)
+                        .setProgressSegments(segments)
+                )
             } else {
-                NotificationCompat.Builder(context, CHANNEL_TODO)
-                    .setProgress(100, pct, false)
-                    .setContentTitle(title)
-                    .setContentText(text)
-                    .setSmallIcon(android.R.drawable.stat_sys_download)
-                    .setContentIntent(deepLink)
-                    .setOngoing(true)
-                    .build()
+                builder.setProgress(100, pct, false)
             }
-            nm.notify(TODO_NOTIFICATION_ID, notification)
+            nm.notify(TODO_NOTIFICATION_ID, builder.build())
         }
 
-        fun cancelTodoNotification(context: Context) {
-            context.getSystemService(NotificationManager::class.java).cancel(TODO_NOTIFICATION_ID)
+        /** 实时活动胶囊（promoted ongoing）是否已被允许发布（API 36+；ColorOS 16 流体云的前提）。 */
+        fun promotedOngoingEnabled(context: Context): Boolean =
+            android.os.Build.VERSION.SDK_INT >= 36 &&
+                context.getSystemService(NotificationManager::class.java).canPostPromotedNotifications()
+
+        /** 跳系统"提升的通知/实时活动"设置页（Google platform-samples live-updates 同款 intent）。 */
+        fun openPromotedSettings(context: Context) {
+            if (android.os.Build.VERSION.SDK_INT < 36) return
+            context.startActivity(
+                Intent(Settings.ACTION_APP_NOTIFICATION_PROMOTION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+            )
         }
+
+        private const val TAG = "ConnectionService"
 
         /** 设备凭据被 daemon 拒绝（吊销/token 轮换）：UI 消费后应掉回配对屏。 */
         private val _authRevoked = MutableStateFlow(false)
@@ -443,26 +580,119 @@ class ConnectionService : Service() {
         }
 
         /** 审批应答：按 kind 分派；当前阶段仍用 canonical id（后端 M0 后换 opaque challenge id）。 */
+        /**
+         * device 身份的待审批投影源：GET /approvals 的 challenge 快照。
+         * canonical id 不出 daemon——SSE interaction_requested 的 id 无法与 challenge
+         * 关联、更不能用它应答，device 模式待审批列表**整体以快照为准**，SSE 只作
+         * 立即刷新的触发器。daemon 按 (kind, session, source) 去重签发，challenge_id
+         * 跨刷新稳定。刷新时机 = 会话发现循环每 15s + SSE 交互事件 + 应答成功后。
+         */
+        private suspend fun refreshChallenges(conn: RingingConnection, sessionId: String) {
+            val lease = (_connectionState.value as? RingingConnection.State.Connected)?.clientSessionId
+                ?: return
+            val approvals = runCatching {
+                withTimeoutOrNull(10_000) { conn.api.approvals(lease, sessionId) }
+            }.onFailure {
+                android.util.Log.w(TAG, "challenges refresh failed: $it")
+            }.getOrNull() ?: return
+            val svc = running
+            val mapped = approvals.challenges.map { c ->
+                val kind = when (c.kind) {
+                    ApprovalChallenge.KIND_TOOL_PERMISSION -> InteractionKinds.PERMISSION
+                    ApprovalChallenge.KIND_ASK -> InteractionKinds.ASK
+                    ApprovalChallenge.KIND_PLAN -> InteractionKinds.PLAN
+                    else -> c.kind
+                }
+                val previous = _pendingApprovals.value.firstOrNull { it.interactionId == c.challengeId }
+                PendingApproval(
+                    interactionId = c.challengeId,
+                    kind = kind,
+                    callId = null,
+                    summary = previous?.summary ?: challengeSummaryOf(c, svc),
+                    // 首次签发时算的到期时间保留，避免每轮刷新把通知倒计时重置
+                    expiresAtMs = previous?.expiresAtMs
+                        ?: c.expiresInSeconds?.let { System.currentTimeMillis() + it * 1000 },
+                )
+            }
+            val previousList = _pendingApprovals.value
+            _pendingApprovals.value = mapped
+            // 新出现的 challenge 发通知；消失的（已消费/过期）撤面板与通知
+            mapped.filter { m -> previousList.none { it.interactionId == m.interactionId } }
+                .forEach { svc?.notifyApproval(it) }
+            previousList.filter { e -> mapped.none { it.interactionId == e.interactionId } }
+                .forEach { e ->
+                    svc?.cancelApprovalCountdown(e.interactionId)
+                    svc?.getSystemService(NotificationManager::class.java)
+                        ?.cancel(APPROVAL_NOTIFICATION_BASE + e.interactionId.hashCode())
+                }
+        }
+
+        /** challenge details → 摘要。permission 是白名单字段投影；ask/plan 是交互正文原样。 */
+        private fun challengeSummaryOf(c: ApprovalChallenge, svc: ConnectionService?): String = when (c.kind) {
+            ApprovalChallenge.KIND_TOOL_PERMISSION -> {
+                val d = c.permissionDetails
+                listOfNotNull(
+                    d?.toolName,
+                    d?.actionSummary ?: d?.reason,
+                    d?.paths?.firstOrNull(),
+                ).joinToString(" · ").ifBlank { "工具调用请求" }
+            }
+            ApprovalChallenge.KIND_ASK -> svc?.askSummaryOf(c.details) ?: "提问"
+            else -> (c.details as? JsonObject)?.let { o ->
+                listOf("plan", "text", "summary", "title").firstNotNullOfOrNull { key ->
+                    (o[key] as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
+                }
+            } ?: "计划评审"
+        }
+
+        /**
+         * 审批应答：按身份分派。
+         * - device 身份（扫码配对）：走 challenge 流 `POST /approvals/respond`——一次性
+         *   opaque challenge_id（即 [PendingApproval.interactionId]），canonical id 不出
+         *   daemon，命令通道应答对 device 走不通。
+         * - admin/Direct（手输配对）：维持 canonical 命令通道（respondInteraction）。
+         */
         suspend fun respondApproval(
             context: Context,
             approval: PendingApproval,
             approved: Boolean,
         ): Result<com.qaqh.harness.data.ringing.model.CommandAck> {
             val conn = connection ?: return Result.failure(IllegalStateException("未连接"))
-            // 调用方是 UI scope，网络必须切 IO（否则 NetworkOnMainThreadException）
+            val sessionId = conn.currentSessionId()
+                ?: return Result.failure(IllegalStateException("无目标会话"))
+            val isDevice = deviceScope != null
             val result = runCatching {
-                withContext(Dispatchers.IO) { conn.respondInteraction(approval.kind, approval.interactionId, approval.callId, approved) }
+                withContext(Dispatchers.IO) {
+                    if (isDevice) {
+                        val lease = (_connectionState.value as? RingingConnection.State.Connected)?.clientSessionId
+                            ?: error("未连接")
+                        val decision = when (approval.kind) {
+                            InteractionKinds.ASK -> ApprovalDecisions.DISMISS
+                            else -> if (approved) ApprovalDecisions.APPROVE else ApprovalDecisions.REJECT
+                        }
+                        conn.api.approvalRespond(lease, sessionId, approval.interactionId, decision)
+                    } else {
+                        conn.respondInteraction(approval.kind, approval.interactionId, approval.callId, approved)
+                    }
+                }
             }
             result.onSuccess { ack ->
                 if (ack.status != "accepted") {
-                    _lastRespondError.value = "命令被拒绝：${ack.code ?: ""} ${ack.message ?: ""}"
+                    _lastRespondError.value = when (ack.code) {
+                        "interaction_already_resolved" -> "该请求已被处理（电脑端已应答）"
+                        "insufficient_scope" -> "权限不足：当前设备档位无法执行该操作"
+                        else -> "命令被拒绝：${ack.code ?: ""} ${ack.message ?: ""}"
+                    }
                 } else {
-                    // 乐观移除：ack 已受理就先撤面板和通知，不等 SSE interaction_resolved
-                    //（个别应答路径的事件归因链路后端仍在补，迟到/丢失会让面板僵住）
+                    // 乐观移除：ack 已受理就先撤面板和通知，不等可能迟到的 SSE resolution
                     context.getSystemService(NotificationManager::class.java)
                         .cancel(APPROVAL_NOTIFICATION_BASE + approval.interactionId.hashCode())
                     _pendingApprovals.value =
                         _pendingApprovals.value.filterNot { it.interactionId == approval.interactionId }
+                    if (isDevice) {
+                        // challenge 已一次性消费：立即刷新快照（回收空位/承接新签发）
+                        runCatching { refreshChallenges(conn, sessionId) }
+                    }
                 }
             }.onFailure { e ->
                 _lastRespondError.value = "应答失败：${e.message ?: e.javaClass.simpleName}"

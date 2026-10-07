@@ -20,6 +20,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -83,6 +84,45 @@ fun SettingsScreen(
             }
             SettingRow("配对时间", java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
                 .format(java.util.Date(credentials.pairedAtMs)))
+        }
+        SettingSection("实时活动") {
+            if (android.os.Build.VERSION.SDK_INT >= 36) {
+                val context = androidx.compose.ui.platform.LocalContext.current
+                val promotedEnabled = remember { ConnectionService.promotedOngoingEnabled(context) }
+                val (label, color) = if (promotedEnabled) {
+                    "已开启" to MaterialTheme.colorScheme.primary
+                } else {
+                    "未开启" to MaterialTheme.colorScheme.outline
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.padding(vertical = 8.dp),
+                ) {
+                    Box(Modifier.size(10.dp).clip(CircleShape).background(color))
+                    Column(Modifier.weight(1f)) {
+                        Text(label, style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "待办进度以流体云胶囊/锁屏卡片常驻展示（离开应用仍可见）",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                if (!promotedEnabled) {
+                    Button(
+                        onClick = { ConnectionService.openPromotedSettings(context) },
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                    ) { Text("去系统设置开启") }
+                }
+            } else {
+                Text(
+                    "需要 Android 16+（API 36）",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+            }
         }
         SettingSection("关于") {
             SettingRow("版本", BuildConfig.VERSION_NAME)

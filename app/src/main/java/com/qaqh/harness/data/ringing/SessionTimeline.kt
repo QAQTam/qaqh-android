@@ -74,6 +74,7 @@ class SessionTimeline(
                     // 不能只在 Connected 状态变化时订阅——续租失败路径的 connectOnce
                     // 不经过 Connecting，状态不变但租约已换，旧租约的 live 帧会被
                     // 服务端逐帧静默丢弃（sse.rs should_deliver_timeline_live）。
+                    var resubDelayMs = 1_000L
                     while (isActive) {
                         val sid = connection.leases.first()
                         // 游标 = 当前 epoch + 已消费水位：epoch 变了（daemon 重启）服务端会
@@ -91,6 +92,7 @@ class SessionTimeline(
                                 // 空闲看门狗：服务端每 15s 发 keepalive 注释（OkHttp 监听器看不到），
                                 // 正常流式期间帧间隔远小于此。长时间零帧说明流已半开/黑洞
                                 // （网络切换、代理回收），带游标重订阅快速恢复。
+                                // 阈值对齐 Rust v2_stream.rs 的 45s 字节级探活。
                                 var lastFrameAt = System.nanoTime()
                                 val watchdog = launch {
                                     while (true) {
@@ -108,6 +110,7 @@ class SessionTimeline(
                                     connection.api.timelineEvents(sid, sessionId, cursor).collect { ev ->
                                         lastFrameAt = System.nanoTime()
                                         frames++
+                                        if (frames == 1) resubDelayMs = 1_000L // 流恢复正常，退避归位
                                         if (frames == 1 || frames % 100 == 0) {
                                             android.util.Log.i(TAG, "timeline SSE frames=$frames")
                                         }
@@ -128,12 +131,14 @@ class SessionTimeline(
                             continue
                         } catch (e: StreamIdle) {
                             android.util.Log.w(TAG, "timeline SSE idle ${IDLE_TIMEOUT_MS}ms — resubscribe with cursor")
-                            delay(1_000)
                         } catch (e: RingingApi.ApiException) {
                             android.util.Log.w(TAG, "timeline SSE ApiException ${e.httpStatus} ${e.code}")
                             if (e.httpStatus != 401) throw e
                         }
-                        delay(1_000)
+                        // 断流后重订阅退避：首帧到达时归位 1s，持续连不上/连上即断时
+                        // 指数增长（1s→30s），避免对抖动的 daemon 形成重连风暴
+                        delay(resubDelayMs)
+                        resubDelayMs = minOf(resubDelayMs * 2, RESUB_DELAY_MAX_MS)
                     }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -151,8 +156,11 @@ class SessionTimeline(
     private companion object {
         const val TAG = "SessionTimeline"
 
-        /** 无帧判定为死流的阈值；服务端 15s keepalive 只保管道，帧级空闲超过它即重订阅。 */
-        const val IDLE_TIMEOUT_MS = 60_000L
+        /** 无帧判定为死流的阈值；服务端 15s keepalive 只保管道，帧级空闲超过它即重订阅。对齐 Rust 45s。 */
+        const val IDLE_TIMEOUT_MS = 45_000L
+
+        /** 重订阅退避上限（对齐 Rust v2_stream 1s→30s）。 */
+        const val RESUB_DELAY_MAX_MS = 30_000L
 
         /** 工具进度缓冲上限（对齐 TUI MAX_PROGRESS_LEN），超出截头保尾。 */
         const val MAX_PROGRESS_LEN = 8_192
@@ -194,6 +202,9 @@ class SessionTimeline(
             if (ack.status != "accepted") {
                 _sendError.value = when (ack.code) {
                     "not_driver" -> "命令未受理：另一客户端正在驾驶该会话（${ack.message ?: "driver seat occupied"}）"
+                    // view 档设备发会话命令会被 scope 门拒（需要 interact 档）
+                    "insufficient_scope" -> "权限不足：当前设备档位无法执行该操作（需要 interact）"
+                    "interaction_already_resolved" -> "该请求已被处理（电脑端已应答），无需重复操作"
                     else -> "命令未受理：${ack.code ?: ""} ${ack.message ?: ""}".trim()
                 }
             } else {
@@ -266,13 +277,8 @@ class SessionTimeline(
             turn.rounds.forEach { round ->
                 round.blocks.forEach { block ->
                     val tool = block.tool ?: return@forEach
-                    if (!com.qaqh.harness.data.ringing.model.TodoState.isTodoTool(tool.name)) return@forEach
-                    state = when (tool.name?.lowercase()) {
-                        "todo_update" -> state?.let {
-                            com.qaqh.harness.data.ringing.model.TodoState.parseUpdate(tool.argsJson, it)
-                        } ?: state
-                        else -> com.qaqh.harness.data.ringing.model.TodoState.parseWrite(tool.argsJson, state) ?: state
-                    }
+                    state = com.qaqh.harness.data.ringing.model.TodoState
+                        .ingestTool(state, tool.name, tool.argsJson)
                 }
             }
         }
@@ -390,15 +396,9 @@ class SessionTimeline(
             "tool_updated" -> data["tool"]?.let { decodeTool(it) }
             else -> null
         }
-        if (tool != null && com.qaqh.harness.data.ringing.model.TodoState.isTodoTool(tool.name)) {
-            val next = when (tool.name?.lowercase()) {
-                "todo_update" -> _todos.value?.let {
-                    com.qaqh.harness.data.ringing.model.TodoState.parseUpdate(tool.argsJson, it)
-                }
-                else -> com.qaqh.harness.data.ringing.model.TodoState.parseWrite(tool.argsJson, _todos.value)
-            }
-            next?.let { _todos.value = it }
-        }
+        com.qaqh.harness.data.ringing.model.TodoState
+            .ingestTool(_todos.value, tool?.name, tool?.argsJson)
+            ?.let { _todos.value = it }
     }
 
     private fun decodeTool(element: kotlinx.serialization.json.JsonElement): TimelineTool? =

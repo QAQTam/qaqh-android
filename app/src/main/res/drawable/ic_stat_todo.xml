@@ -1,0 +1,19 @@
+<!-- 状态栏/实时活动胶囊小图标：待办清单（check + 行 + 空框），白色 alpha 模板 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M9,5h12v2h-12z M9,11h12v2h-12z M9,17h12v2h-12z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M4.5,9L2,6.5L3.2,5.3L4.5,6.6L7.8,3.3L9,4.5z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M2.5,10.5h3v3h-3z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M2.5,15.5h3v3h-3z" />
+</vector>

@@ -86,6 +86,7 @@ class PairingClient(private val deviceName: String) {
             deviceId = response.device_id,
             deviceName = deviceName,
             pairedAtMs = System.currentTimeMillis(),
+            scope = response.scope,  // device 身份标记（view|interact|admin）；Direct/手输为 null
             tlsFingerprint = payload.tlsFingerprint,
         )
     }

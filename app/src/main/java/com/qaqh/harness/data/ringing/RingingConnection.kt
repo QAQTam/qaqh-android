@@ -15,15 +15,19 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -96,6 +100,17 @@ class RingingConnection(
     )
     val leases: SharedFlow<String> = _leases
 
+    /**
+     * 续租放弃信号（连续 2 次失败）：租约已死，主循环必须整体重连。旧实现由续租
+     * 循环直接 connectOnce——与主循环自身的重开路径竞争（双租约，且主循环还挂在
+     * 旧流的 collect 上直到它被服务端掐断）。改为发信号，由 streamEvents 监听后
+     * 抛 LeaseExpired 交回 runWithBackoff，全进程只有一条重连路径。
+     */
+    private val _leaseExpired = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+
+    /** 主循环内部信号：当前流的租约已失效/轮换，按情况本地重订阅或整体重连。 */
+    private object LeaseExpired : Exception("lease expired")
+
     private var instanceId: String = UUID.randomUUID().toString()
     private var clientSessionId: String? = null
     private var serverEpoch: String? = null
@@ -122,6 +137,9 @@ class RingingConnection(
             mainLoop = scope.launch { runWithBackoff() }
         }
     }
+
+    /** 当前目标会话（全局跟踪器/外部订阅者读取用；切会话后随主循环生效）。 */
+    suspend fun currentSessionId(): String? = mutex.withLock { sessionId }
 
     suspend fun stop() {
         mainLoop?.cancelAndJoin()
@@ -207,23 +225,35 @@ class RingingConnection(
     private suspend fun postCommand(channel: String, command: kotlinx.serialization.json.JsonObject): CommandAck {
         val sid = mutex.withLock { clientSessionId } ?: error("not connected")
         val sessionId = mutex.withLock { sessionId }
-        return api.postCommand(
+        val commandId = UUID.randomUUID().toString()
+        val ack = api.postCommand(
             sid,
             CommandEnvelope(
                 channel = channel,
-                commandId = UUID.randomUUID().toString(),
+                commandId = commandId,
                 clientInstanceId = instanceId,
                 clientSessionId = sid,
                 sessionId = sessionId,
                 command = command,
             ),
         )
+        // 对齐 Rust v2.rs：ack 对不上提交 id 说明回执错位（幂等重放/服务端异常），
+        // 不能当成本命令的结果继续消费
+        if (ack.commandId != commandId) {
+            throw RingingApi.ApiException(
+                httpStatus = 0,
+                code = "ack_command_id_mismatch",
+                message = "ack for ${ack.commandId} but sent $commandId",
+            )
+        }
+        return ack
     }
 
     private suspend fun runWithBackoff() {
         var backoffMs = 1_000L
         while (scope.isActive) {
             _state.value = State.Connecting
+            var transient = false
             try {
                 connectOnce()
                 streamEvents()
@@ -234,16 +264,21 @@ class RingingConnection(
                 throw e
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "connection loop failure: ${e.message}", e)
+                val apiException = e as? RingingApi.ApiException
+                // 会话尚未物化（session_not_found/snapshot_missing，404/409 或同义 code）是
+                // 新建会话首个 canonical 事实落盘前的正常瞬态（对齐 Rust error.rs）：保持
+                // 1s 短退避，不吃指数增长。正常路径下这类瞬态由 streamEvents 内部的
+                // bootstrap 重试就地消化，不走到这里。
+                transient = apiException?.isSessionNotReady == true
                 // 只有"真鉴权失败"（无 code 的 unauthorized）才算吊销；lease_required 也是 401，
                 // 但只是租约没 attach，属于常规竞态，绝不能触发清凭据
-                val apiException = e as? RingingApi.ApiException
                 _state.value = State.Failed(
                     e.message ?: e.javaClass.simpleName,
                     unauthorized = apiException?.isUnauthorized == true && apiException.code != "lease_required",
                 )
             }
-            delay(backoffMs)
-            backoffMs = min(backoffMs * 2, 30_000L)
+            delay(if (transient) 1_000L else backoffMs)
+            if (!transient) backoffMs = min(backoffMs * 2, 30_000L)
         }
     }
 
@@ -251,6 +286,10 @@ class RingingConnection(
         val open = api.open(instanceId)
         mutex.withLock {
             clientSessionId = open.clientSessionId
+            // daemon 重启（epoch 变化）后旧 canonical 游标语义失效：归零，streamEvents
+            // 会重新 bootstrap 拿新快照（以前靠每轮重开时的 bootstrap 顺带覆盖，
+            // 现在游标跨周期复用，必须在这里显式作废）
+            if (serverEpoch != open.serverEpoch) cursor = null
             serverEpoch = open.serverEpoch
         }
         // attach 要在 Connected/bootstrap 前完成：timeline/content 等 attach 门控接口依赖它，
@@ -281,15 +320,22 @@ class RingingConnection(
             var failures = 0
             while (isActive && sid == mutex.withLock { clientSessionId }) {
                 try {
-                    api.renew(sid)
+                    // 请求级 10s 超时（对齐 Rust session.rs BUG-2026-09-13-09）：
+                    // daemon 冷启动挂起时 renew 不能永久阻塞续租循环
+                    if (withTimeoutOrNull(10_000) { api.renew(sid) } == null) {
+                        throw java.util.concurrent.TimeoutException("renew timed out")
+                    }
                     failures = 0
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
                 } catch (e: Exception) {
                     if (++failures >= 2) {
-                        // 租约失效：重新 open（新 server_epoch 会使 SSE cursor 失效）
+                        // 租约已死。不发新租约、不直接重连（那会与主循环的重开路径竞争，
+                        // 造成双租约且主循环仍挂在旧流的 collect 上）；归零游标（防陈旧
+                        // epoch 游标跨租约复用）后发信号，streamEvents 感知后抛
+                        // LeaseExpired 交回 runWithBackoff 走统一的重连周期。
                         mutex.withLock { cursor = null }
-                        connectOnce()
+                        _leaseExpired.tryEmit(Unit)
                         break
                     }
                 }
@@ -301,47 +347,88 @@ class RingingConnection(
     private suspend fun streamEvents() {
         val sessionId = mutex.withLock { sessionId }
         if (sessionId == null) {
-            awaitCancellation()
+            // 无目标会话：租约照常保活（续租循环在跑），等续租放弃信号触发重连周期。
+            // （旧实现 awaitCancellation 挂死——daemon 重启后 renew 失败也没人触发重连。）
+            _leaseExpired.first()
+            throw LeaseExpired
         }
-        val sid = mutex.withLock { clientSessionId } ?: return
-        if (mutex.withLock { cursor } == null) {
-            val boot = api.bootstrap(sid, sessionId)
-            mutex.withLock {
-                if (serverEpoch != boot.serverEpoch) cursor = null
-                serverEpoch = boot.serverEpoch
-                cursor = boot.snapshotCursor
+        while (true) {
+            val sid = mutex.withLock { clientSessionId } ?: throw LeaseExpired
+            if (mutex.withLock { cursor } == null) {
+                bootstrapSnapshot(sid, sessionId)
             }
-            // attach 已在 connectOnce 完成且失败即中断（时序：open → attach → bootstrap → SSE），
-            // 这里不再重复发——重复 attach 白耗一个命令回合且掩盖时序问题
-            // bootstrap 快照自带当前活动状态，先投影一次（后续靠 SSE activity 增量更新）
-            boot.activity?.let { _events.tryEmit(SessionEvent.Activity(it, null)) }
-            // 快照里已挂起的交互也要投影（重连/后加入的客户端靠它看到积压请求）
-            (boot.control?.state?.get("interactions") as? kotlinx.serialization.json.JsonArray)
-                ?.forEach { element ->
-                    val o = element as? kotlinx.serialization.json.JsonObject ?: return@forEach
-                    val kind = (o["kind"] as? JsonPrimitive)?.content ?: return@forEach
-                    runCatching {
-                        SessionEvent.InteractionRequested(
-                            InteractionRequested(
-                                revision = 0,
-                                interactionId = (o["interaction_id"] as? JsonPrimitive)?.content ?: return@forEach,
-                                callId = (o["call_id"] as? JsonPrimitive)?.content,
-                                kind = kind,
-                                request = o["request"],
-                            )
-                        )
-                    }.getOrNull()?.let { _events.tryEmit(it) }
-                }
-        }
-        val since = mutex.withLock { cursor }
-        api.events(sid, sessionId, since).collect { sse ->
-            when (sse) {
-                is RingingApi.SseEvent.Reset -> {
-                    mutex.withLock { cursor = sse.reset.snapshotCursor }
-                    throw RestartStream // 跳出 collect，回到 connectOnce/streamEvents 循环
-                }
+            try {
+                coroutineScope {
+                    // 租约轮换/续租放弃：当前流作废——轮换走本地重订阅，放弃走整体重连
+                    launch { _leases.drop(1).first(); throw RestartStream }
+                    launch { _leaseExpired.first(); throw LeaseExpired }
+                    val since = mutex.withLock { cursor }
+                    api.events(sid, sessionId, since).collect { sse ->
+                        when (sse) {
+                            is RingingApi.SseEvent.Reset -> {
+                                mutex.withLock { cursor = sse.reset.snapshotCursor }
+                                throw RestartStream // 跳出 collect，本地重订阅
+                            }
 
-                is RingingApi.SseEvent.Ringing -> handleEvent(sse.envelope)
+                            // 服务端丢弃积压（broadcast Lagged）主动掐流：游标仍有效，立即重订阅补尾巴
+                            RingingApi.SseEvent.StreamTerminated -> {
+                                android.util.Log.i(TAG, "stream terminated by server — resubscribing")
+                                throw RestartStream
+                            }
+
+                            is RingingApi.SseEvent.Ringing -> handleEvent(sse.envelope)
+                        }
+                    }
+                }
+                // SSE 正常收尾（服务端 EOF）：游标仍有效，短暂停顿后原租约重订阅——
+                // 不再像旧实现那样整轮重开（每次重连换 client_session_id 是重连风暴之源）
+                android.util.Log.i(TAG, "events stream closed by server — resubscribing")
+                delay(1_000)
+            } catch (e: RestartStream) {
+                // 预期内重订阅信号：立即继续
+            }
+        }
+    }
+
+    /**
+     * 取 bootstrap 快照并投影。会话尚未物化（session_not_found/snapshot_missing，
+     * 404/409）时**保持租约** 1s 短退避重试（对齐 Rust v2_stream 的 not-ready 短退避）：
+     * 新建会话首个 canonical 事实落盘前就是这个状态，重开租约只会每秒轮换一次
+     * client_session_id，旧租约上的全部 timeline SSE 随之 401 雪崩。
+     * 时序不变：open → attach → bootstrap → SSE。
+     */
+    private suspend fun bootstrapSnapshot(sid: String, sessionId: String) {
+        while (true) {
+            try {
+                val boot = api.bootstrap(sid, sessionId)
+                mutex.withLock {
+                    serverEpoch = boot.serverEpoch
+                    cursor = boot.snapshotCursor
+                }
+                // bootstrap 快照自带当前活动状态，先投影一次（后续靠 SSE activity 增量更新）
+                boot.activity?.let { _events.tryEmit(SessionEvent.Activity(it, null)) }
+                // 快照里已挂起的交互也要投影（重连/后加入的客户端靠它看到积压请求）
+                (boot.control?.state?.get("interactions") as? kotlinx.serialization.json.JsonArray)
+                    ?.forEach { element ->
+                        val o = element as? kotlinx.serialization.json.JsonObject ?: return@forEach
+                        val kind = (o["kind"] as? JsonPrimitive)?.content ?: return@forEach
+                        runCatching {
+                            SessionEvent.InteractionRequested(
+                                InteractionRequested(
+                                    revision = 0,
+                                    interactionId = (o["interaction_id"] as? JsonPrimitive)?.content ?: return@forEach,
+                                    callId = (o["call_id"] as? JsonPrimitive)?.content,
+                                    kind = kind,
+                                    request = o["request"],
+                                )
+                            )
+                        }.getOrNull()?.let { _events.tryEmit(it) }
+                    }
+                return
+            } catch (e: RingingApi.ApiException) {
+                if (!e.isSessionNotReady) throw e
+                android.util.Log.i(TAG, "bootstrap ${e.httpStatus}/${e.code ?: "-"}: session not materialized — keep lease, retry in 1s")
+                delay(1_000)
             }
         }
     }

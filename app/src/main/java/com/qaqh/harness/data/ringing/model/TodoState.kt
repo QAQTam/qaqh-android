@@ -51,6 +51,18 @@ data class TodoState(val items: List<TodoItem>) {
 
         fun isTodoTool(name: String?): Boolean = name?.lowercase() in TODO_TOOLS
 
+        /**
+         * timeline 工具块帧 → 待办状态折叠（唯一入口，聊天屏 reducer 与全局实况通知跟踪器共用）：
+         * todo_write/todo_list 整表替换、todo_update 单条 delta；非 todo 工具或畸形帧原样返回。
+         */
+        fun ingestTool(state: TodoState?, toolName: String?, argsJson: String?): TodoState? {
+            if (!isTodoTool(toolName)) return state
+            return when (toolName?.lowercase()) {
+                "todo_update" -> state?.let { parseUpdate(argsJson, it) ?: it }
+                else -> parseWrite(argsJson, state) ?: state
+            }
+        }
+
         /** todo_write / todo_list：整表替换；畸形返回 null。 */
         fun parseWrite(argsJson: String?, previous: TodoState?): TodoState? {
             if (argsJson.isNullOrBlank()) return null

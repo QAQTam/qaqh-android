@@ -3,6 +3,7 @@ package com.qaqh.harness.data.ringing.model
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.serializer
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -56,6 +57,8 @@ data class Capabilities(
     val service: Boolean = false,
     val content: Boolean = false,
     @SerialName("single_stream") val singleStream: Boolean = false,
+    /** M0 设备鉴权：daemon 是否支持 /pairing/tokens + /pair 扫码配对。 */
+    val pairing: Boolean = false,
 )
 
 // ---------- leases/renew ----------
@@ -270,7 +273,14 @@ inline fun <reified T> EventEnvelope.decodePayloadData(json: kotlinx.serializati
 
 // ---------- service RPC：session.list ----------
 
-/** `POST /service/session.list` 的条目（对齐 qaqh-types SessionListEntry wire 形状）。 */
+/**
+ * `POST /service/session.list` 的条目（对齐 qaqh-types SessionListEntry wire 形状）。
+ *
+ * 兼容两代 daemon：backend-fix 之后 `running: bool` 被 8 态词表 `status` 取代
+ * （not_running/idle/working/waiting_permission/waiting_ask/waiting_plan/canceled/error），
+ * 且 `last_summary` 删除、新增 `title/archived/ephemeral`。旧 daemon 只发 `running`。
+ * 判定与展示一律走 [runStatus]，不要直接读 [running]/[status]。
+ */
 @Serializable
 data class SessionListEntry(
     @SerialName("session_id") val sessionId: String,
@@ -279,18 +289,47 @@ data class SessionListEntry(
     val model: String? = null,
     @SerialName("message_count") val messageCount: Int = 0,
     @SerialName("turn_count") val turnCount: Int = 0,
+    /** 列表标题（新 daemon）；title→cwd 尾段→session_id 的 G2 契约在服务端已折好。 */
+    val title: String? = null,
+    /** 旧 daemon 的摘要字段，新 daemon 已删除。 */
     @SerialName("last_summary") val lastSummary: String? = null,
+    /** 旧 daemon 的运行中标记，新 daemon 已删除（serde 缺键恒 false）。 */
     val running: Boolean = false,
+    /** 新 daemon 的 8 态运行状态词表；旧 daemon 缺此键。 */
+    val status: String? = null,
+    val archived: Boolean = false,
+    val ephemeral: Boolean = false,
     @SerialName("workspace_id") val workspaceId: String? = null,
-)
+) {
+    /** 归一后的运行状态：优先新词表，旧 daemon 用 running 推导（working 即运行中）。 */
+    val runStatus: String
+        get() = status ?: if (running) "working" else "not_running"
+
+    /** 是否正在执行回合（Home 卡呼吸点/自动发现选流的依据）。 */
+    val isWorking: Boolean get() = runStatus == "working"
+
+    /** 卡片主标题：title → 旧摘要 → 兜底。 */
+    val displayTitle: String?
+        get() = title?.takeIf { it.isNotBlank() } ?: lastSummary?.takeIf { it.isNotBlank() }
+}
+
+private val approvalJson = Json { ignoreUnknownKeys = true }
 
 // ---------- approvals ----------
 
-/** GET /ringing/v2/sessions/{session_id}/approvals 的返回体。 */
+/**
+ * GET /ringing/v2/sessions/{session_id}/approvals 的返回体。
+ *
+ * 双形状：admin 身份得 `{pending_permission, pending_interaction}`（canonical id 透传）；
+ * device 身份得 `{challenges:[...]}`（opaque challenge_id，canonical id 不出 daemon）。
+ * 消费端先看 [challenges]（device 路径，必须走 /approvals/respond 应答），
+ * 为空再落到 pending_*（admin 路径，走命令通道）。
+ */
 @Serializable
 data class Approvals(
     @SerialName("pending_permission") val pendingPermission: PendingPermission? = null,
     @SerialName("pending_interaction") val pendingInteraction: PendingInteraction? = null,
+    val challenges: List<ApprovalChallenge> = emptyList(),
 ) {
     @Serializable
     data class PendingPermission(
@@ -311,4 +350,56 @@ data class Approvals(
         val kind: String,
         val details: JsonElement? = null,
     )
+}
+
+/** device 身份的待审批条目（challenge.rs ApprovalChallenge::view）。 */
+@Serializable
+data class ApprovalChallenge(
+    @SerialName("challenge_id") val challengeId: String,
+    /** tool_permission | ask | plan（注意 tool 权限的 wire 值不是 "permission"）。 */
+    val kind: String,
+    /** 距过期的秒数（TTL 5min，一次性消费）。 */
+    @SerialName("expires_in") val expiresInSeconds: Long? = null,
+    val details: JsonElement? = null,
+) {
+    /** permission 白名单投影；ask/plan 的 details 是交互正文原样（questions/plan 文本），不走这里。 */
+    val permissionDetails: ApprovalChallengeDetails?
+        get() = (details as? JsonObject)?.let {
+            runCatching {
+                approvalJson.decodeFromString(ApprovalChallengeDetails.serializer(), it.toString())
+            }.getOrNull()
+        }
+
+    companion object {
+        const val KIND_TOOL_PERMISSION = "tool_permission"
+        const val KIND_ASK = "ask"
+        const val KIND_PLAN = "plan"
+    }
+}
+
+/** challenge details 白名单字段（daemon 侧只透出这些，其余一律不给）。 */
+@Serializable
+data class ApprovalChallengeDetails(
+    @SerialName("tool_name") val toolName: String? = null,
+    @SerialName("action_summary") val actionSummary: String? = null,
+    val reason: String? = null,
+    val paths: List<String> = emptyList(),
+    val category: String? = null,
+    val level: Int? = null,
+    val risk: String? = null,
+    val consequence: String? = null,
+)
+
+/**
+ * `POST /approvals/respond` 的决策枚举（challenge.rs command_for 的固定集合）：
+ * tool_permission → approve/reject/trust（device 提交 trust 被服务端强制降级为单次放行，
+ * UI 不应提供"永久信任"）；ask → submit（payload.answers）/dismiss；
+ * plan → approve/reject（payload.message/autonomous）。
+ */
+object ApprovalDecisions {
+    const val APPROVE = "approve"
+    const val REJECT = "reject"
+    const val TRUST = "trust"
+    const val SUBMIT = "submit"
+    const val DISMISS = "dismiss"
 }

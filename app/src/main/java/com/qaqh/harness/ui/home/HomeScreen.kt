@@ -61,10 +61,15 @@ private data class ActivityPresentation(val color: androidx.compose.ui.graphics.
 
 @Composable
 private fun presentActivity(state: String?): ActivityPresentation = when (state) {
-    "running" -> ActivityPresentation(MaterialTheme.colorScheme.primary, "工作中")
+    "running", "working" -> ActivityPresentation(MaterialTheme.colorScheme.primary, "工作中")
     "idle" -> ActivityPresentation(MaterialTheme.colorScheme.outline, "空闲")
-    "interrupted" -> ActivityPresentation(MaterialTheme.colorScheme.error, "已中断")
-    null -> ActivityPresentation(MaterialTheme.colorScheme.outline, "无活动")
+    "interrupted", "canceled" -> ActivityPresentation(MaterialTheme.colorScheme.error, "已中断")
+    // session.list 新词表的等待态（backend-fix 后 status 取代 running:bool）
+    "waiting_permission" -> ActivityPresentation(MaterialTheme.colorScheme.tertiary, "等待授权")
+    "waiting_ask" -> ActivityPresentation(MaterialTheme.colorScheme.tertiary, "等待回答")
+    "waiting_plan" -> ActivityPresentation(MaterialTheme.colorScheme.tertiary, "等待评审")
+    "error" -> ActivityPresentation(MaterialTheme.colorScheme.error, "出错")
+    null, "not_running" -> ActivityPresentation(MaterialTheme.colorScheme.outline, "无活动")
     else -> ActivityPresentation(MaterialTheme.colorScheme.tertiary, state)
 }
 
@@ -191,8 +196,15 @@ private fun SessionCard(
     modifier: Modifier = Modifier,
     onClick: () -> Unit = {},
 ) {
-    val running = session.running || activity == "running"
-    val ap = presentActivity(if (running) "running" else activity)
+    // 状态来源优先级：会话执行中（新旧 daemon 兼容判定）> control activity > status 词表等待态
+    val running = session.isWorking || activity == "running"
+    val displayState = when {
+        running -> "running"
+        session.runStatus.startsWith("waiting_") -> session.runStatus
+        session.runStatus == "error" -> "error"
+        else -> activity
+    }
+    val ap = presentActivity(displayState)
     Card(
         modifier = modifier.clickable(onClick = onClick, role = Role.Button),
         shape = RoundedCornerShape(CardCorner),
@@ -223,7 +235,8 @@ private fun SessionCard(
                     modifier = Modifier.weight(1f),
                 )
             }
-            val summary = session.lastSummary?.takeIf { it.isNotBlank() }
+            // 标题契约：title（新 daemon）→ last_summary（旧 daemon）→ 兜底
+            val summary = session.displayTitle
             Text(
                 summary ?: "未命名会话",
                 style = MaterialTheme.typography.titleMedium,

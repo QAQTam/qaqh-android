@@ -85,6 +85,10 @@ object ToolFormatter {
         "write" -> "写入"
         "edit", "apply_patch" -> "编辑"
         "todo_write", "todo_update", "todo_list" -> "更新计划"
+        // 工具系统现代化后 skills 拆分为三个独立工具（qaqh-tool-core tool_capabilities）
+        "skill_activate" -> "启用技能"
+        "skill_list" -> "列出技能"
+        "skill_resource" -> "读取技能资源"
         else -> name?.replace('_', ' ')?.replaceFirstChar { it.uppercase() } ?: "工具"
     }
 

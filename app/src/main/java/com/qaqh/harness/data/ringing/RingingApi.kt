@@ -21,6 +21,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
@@ -61,6 +64,15 @@ class RingingApi(
         message: String,
     ) : Exception("HTTP $httpStatus ${code ?: "-"}: $message") {
         val isUnauthorized: Boolean get() = httpStatus == 401
+
+        /**
+         * 会话尚未物化（session_not_found / snapshot_missing，HTTP 404/409）：
+         * 新建会话在首个 canonical 事实落盘前的正常瞬态（对齐 Rust error.rs
+         * is_session_not_ready）。调用方应短退避重试且**保持租约**，不得重开。
+         */
+        val isSessionNotReady: Boolean
+            get() = httpStatus == 404 || httpStatus == 409 ||
+                code == "session_not_found" || code == "snapshot_missing"
     }
 
     private fun requestBuilder(path: String, clientSessionId: String? = null): Request.Builder {
@@ -105,9 +117,33 @@ class RingingApi(
     fun bootstrap(clientSessionId: String, sessionId: String): Bootstrap =
         execute(requestBuilder("/sessions/$sessionId/bootstrap", clientSessionId).get().build())
 
-    /** GET /sessions/{session_id}/approvals，当前待审批快照。 */
+    /** GET /sessions/{session_id}/approvals，当前待审批快照（admin 得 pending_*，device 得 challenges）。 */
     fun approvals(clientSessionId: String, sessionId: String): Approvals =
         execute(requestBuilder("/sessions/$sessionId/approvals", clientSessionId).get().build())
+
+    /**
+     * POST /sessions/{session_id}/approvals/respond — device 身份的审批应答（S5）。
+     * [decision] 取 [com.qaqh.harness.data.ringing.model.ApprovalDecisions]；
+     * ask.submit 需 payload={"answers":[...]}，plan.reject 可带 {"message","autonomous"}。
+     * 一次性消费 challenge：错 session/过期/重复消费得 403（challenge rejected）。
+     */
+    fun approvalRespond(
+        clientSessionId: String,
+        sessionId: String,
+        challengeId: String,
+        decision: String,
+        payload: JsonObject? = null,
+    ): CommandAck = execute(
+        requestBuilder("/sessions/$sessionId/approvals/respond", clientSessionId)
+            .post(
+                buildJsonObject {
+                    put("challenge_id", challengeId)
+                    put("decision", decision)
+                    if (payload != null) put("payload", payload)
+                }.toString().toRequestBody(jsonMedia)
+            )
+            .build()
+    )
 
     /** POST /commands/{channel}，提交命令信封，返回回执（回执 status 也可能是 rejected）。 */
     fun postCommand(clientSessionId: String, envelope: CommandEnvelope): CommandAck = execute(
@@ -232,6 +268,9 @@ class RingingApi(
             override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
                 when (type) {
                     EVENT_RESET -> trySendBlocking(SseEvent.Reset(json.decodeFromString<ResetRequired>(data)))
+                    // daemon 在 broadcast Lagged（消费端跟不上被丢弃）时下发：必须据此
+                    // 立即重订阅，静默丢弃会丢增量直到空闲看门狗兜底（最长 45s）
+                    EVENT_STREAM_TERMINATED -> trySendBlocking(SseEvent.StreamTerminated)
                     null, EVENT_RINGING -> {
                         val envelope = json.decodeFromString<EventEnvelope>(data)
                         trySendBlocking(SseEvent.Ringing(envelope, id))
@@ -253,6 +292,9 @@ class RingingApi(
     sealed interface SseEvent {
         data class Ringing(val envelope: EventEnvelope, val sseId: String?) : SseEvent
         data class Reset(val reset: ResetRequired) : SseEvent
+
+        /** 服务端主动终止本条流（broadcast Lagged 等），消费端应立即重订阅。 */
+        data object StreamTerminated : SseEvent
     }
 
     companion object {

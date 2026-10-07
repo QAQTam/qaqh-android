@@ -86,10 +86,16 @@ class PairingPayloadException(message: String) : Exception(message)
     data class StoredCredentials(
         val baseUrl: String,
         val token: String,
-        /** 正式配对后的设备 id（/pair 返回）；开发降级为本地生成。 */
-        val deviceId: String,
-        val deviceName: String,
-        val pairedAtMs: Long,
-        /** daemon 证书 SPKI sha256（https 自签时的信任锚）；null = 不 pin（明文 http）。 */
-        val tlsFingerprint: String? = null,
-    )
+    /** 正式配对后的设备 id（/pair 返回）；开发降级为本地生成。 */
+    val deviceId: String,
+    val deviceName: String,
+    val pairedAtMs: Long,
+    /**
+     * /pair 签发的权限档位（view|interact|admin）——**device 身份的标记**（非空即
+     * 设备身份：审批走 challenge 流 /approvals/respond，canonical id 不出 daemon）。
+     * Direct/手输配对为 null（admin token，审批走 canonical 命令通道）。
+     */
+    val scope: String? = null,
+    /** daemon 证书指纹 sha256（https 自签时的信任锚）；null = 不 pin（明文 http）。 */
+    val tlsFingerprint: String? = null,
+)
