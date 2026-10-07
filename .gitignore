@@ -9,3 +9,6 @@ captures/
 .cxx/
 .tools/
 tmp/
+
+# ZCode session-local state
+.zcode/
