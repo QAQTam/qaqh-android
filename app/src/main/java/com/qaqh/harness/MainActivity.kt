@@ -8,12 +8,18 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.PredictiveBackHandler
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.ChatBubble
@@ -33,7 +39,9 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import com.qaqh.harness.connection.ConnectionService
@@ -160,18 +168,67 @@ fun AppRoot(modifier: Modifier = Modifier) {
         )
     } else {
         val creds = credentials!!
-        if (openSessionId != null) {
-            BackHandler { openSessionId = null }
-            SessionScreen(
-                sessionId = openSessionId!!,
-                onBack = { openSessionId = null },
-            )
-        } else {
+        // 两级导航：主页常驻组合，聊天屏作覆盖层——预测返回手势期间主页按进度放大"露出"。
+        val chatProgress = remember { Animatable(0f) } // 0=全开, 1=完全滑出
+
+        Box(
+            Modifier.graphicsLayer {
+                if (openSessionId != null) {
+                    val reveal = chatProgress.value
+                    val s = 1f - 0.06f * (1f - reveal)
+                    scaleX = s
+                    scaleY = s
+                }
+            },
+        ) {
             TabShell(creds, onUnpair = {
                 ConnectionService.stop(context)
                 store.clear()
                 credentials = null
             }, onOpenSession = { openSessionId = it })
+        }
+
+        openSessionId?.let { id ->
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        val p = chatProgress.value
+                        translationX = p * 0.35f * size.width
+                        val s = 1f - 0.08f * p
+                        scaleX = s
+                        scaleY = s
+                        shadowElevation = 32f * p
+                        shape = RoundedCornerShape(28.dp * p)
+                        clip = p > 0f
+                    }
+                    // SessionScreen 不自铺背景（靠根 Surface），覆盖层必须不透明
+                    .background(androidx.compose.material3.MaterialTheme.colorScheme.background),
+            ) {
+                SessionScreen(
+                    sessionId = id,
+                    onBack = {
+                        scope.launch {
+                            chatProgress.animateTo(1f, tween(200))
+                            openSessionId = null
+                            chatProgress.snapTo(0f)
+                        }
+                    },
+                )
+            }
+            PredictiveBackHandler(enabled = true) { flow ->
+                try {
+                    flow.collect { chatProgress.snapTo(it.progress) }
+                    // 手势提交：收尾滑出后真正关屏
+                    chatProgress.animateTo(1f, tween(150))
+                    openSessionId = null
+                    chatProgress.snapTo(0f)
+                } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+                    // 手势取消：协程已被取消，回弹动画挂到外层 scope
+                    scope.launch { chatProgress.animateTo(0f, spring(dampingRatio = Spring.DampingRatioNoBouncy)) }
+                    throw e
+                }
+            }
         }
     }
 }
