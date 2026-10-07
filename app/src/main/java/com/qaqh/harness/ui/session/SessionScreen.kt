@@ -3,6 +3,11 @@
 package com.qaqh.harness.ui.session
 
 import androidx.compose.foundation.background
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
@@ -40,17 +45,24 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.SmallFloatingActionButton
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.VerifiedUser
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -163,6 +175,32 @@ fun SessionScreen(
         }
     }
 
+    // 历史分页：滚到顶部且上方还有内容时加载更早一页。loadOlder 内部有 Loading/EndReached
+    // 去抖；前插后 LazyColumn 按锚点保持视位（firstVisibleItemIndex 跳到新页尾），
+    // 用户再翻到新顶才会触发下一页，不会连环加载。
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .collect { idx ->
+                // didInitialJump 门控：进屏 pin 到底之前列表短暂停在顶部，不能算"翻到顶"
+                if (didInitialJump && idx == 0 && listState.canScrollBackward && turns.isNotEmpty()) {
+                    timeline.loadOlder()
+                }
+            }
+    }
+
+    // 错误提示走 Snackbar：不再占输入区上方常驻行（与审批条叠罗汉）
+    val snackbarHostState = remember { SnackbarHostState() }
+    LaunchedEffect(sendError) {
+        val err = sendError ?: return@LaunchedEffect
+        snackbarHostState.showSnackbar(err)
+        timeline.consumeSendError()
+    }
+    LaunchedEffect(respondError) {
+        val err = respondError ?: return@LaunchedEffect
+        snackbarHostState.showSnackbar(err)
+        ConnectionService.consumeRespondError()
+    }
+
     // 待办通知已改为 ConnectionService 全局跟踪器驱动（离开聊天屏仍更新/上胶囊），
     // 聊天屏内只保留一行入口 chip
 
@@ -238,50 +276,80 @@ fun SessionScreen(
             }
         }
 
-        // 聊天区
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            contentPadding = PaddingValues(horizontal = ScreenPadding, vertical = BlockSpacing),
-            verticalArrangement = Arrangement.spacedBy(BlockSpacing),
-        ) {
-            items(turns, key = { it.turnId }) { turn -> TurnItem(turn) }
-            when (status) {
-                com.qaqh.harness.data.ringing.SessionTimeline.Status.Loading ->
-                    item { Text("加载中…", style = MaterialTheme.typography.bodySmall) }
-                is com.qaqh.harness.data.ringing.SessionTimeline.Status.Error ->
-                    item {
-                        Text(
-                            (status as com.qaqh.harness.data.ringing.SessionTimeline.Status.Error).message,
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
+        // 聊天区（Box 以便悬浮"回到底部"）
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = ScreenPadding, vertical = BlockSpacing),
+                verticalArrangement = Arrangement.spacedBy(BlockSpacing),
+            ) {
+                // 分页指示在列表头部：加载更早/失败重试（首屏加载的空态在列表尾部）
+                if (turns.isNotEmpty()) {
+                    when (status) {
+                        com.qaqh.harness.data.ringing.SessionTimeline.Status.Loading ->
+                            item(key = "pager-top-loading") {
+                                Text(
+                                    "加载更早…",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = BlockSpacing),
+                                )
+                            }
+                        is com.qaqh.harness.data.ringing.SessionTimeline.Status.Error ->
+                            item(key = "pager-top-error") {
+                                Text(
+                                    "加载更早失败，点按重试",
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.fillMaxWidth().clickable { timeline.loadOlder() },
+                                )
+                            }
+                        else -> Unit
                     }
-                else -> Unit
+                }
+                items(turns, key = { it.turnId }) { turn -> TurnItem(turn) }
+                if (turns.isEmpty()) {
+                    when (status) {
+                        com.qaqh.harness.data.ringing.SessionTimeline.Status.Loading ->
+                            item { Text("加载中…", style = MaterialTheme.typography.bodySmall) }
+                        is com.qaqh.harness.data.ringing.SessionTimeline.Status.Error ->
+                            item {
+                                Text(
+                                    (status as com.qaqh.harness.data.ringing.SessionTimeline.Status.Error).message,
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        else -> Unit
+                    }
+                }
+            }
+            // 回到底部：离开底部即浮现（含流式期间被上翻打断的情形）
+            val canScrollForward by remember { derivedStateOf { listState.canScrollForward } }
+            androidx.compose.animation.AnimatedVisibility(
+                visible = canScrollForward,
+                enter = fadeIn() + slideInVertically { it / 2 },
+                exit = fadeOut() + slideOutVertically { it / 2 },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = ScreenPadding, bottom = BlockSpacing),
+            ) {
+                SmallFloatingActionButton(onClick = {
+                    followBottom = true
+                    scope.launch { pinToBottom(listState) }
+                }) {
+                    Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "回到底部")
+                }
             }
         }
 
-        sendError?.let { err ->
-            Text(
-                err,
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.padding(horizontal = ScreenPadding),
-            )
-        }
-        respondError?.let { err ->
-            Text(
-                err,
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.padding(horizontal = ScreenPadding),
-            )
+        // 待审批（当前会话）：紧凑条，完整卡片进底部弹层（竖屏输入区上方的空间不整段让给卡片）
+        if (approvals.isNotEmpty()) {
+            ApprovalStrip(approvals, Modifier.padding(horizontal = ScreenPadding))
         }
 
-        // 待审批（当前会话）
-        approvals.forEach { approval ->
-            ApprovalCard(approval, Modifier.padding(horizontal = ScreenPadding))
-        }
+        SnackbarHost(snackbarHostState)
 
         // 输入行：胶囊输入框 + 圆形发送钮（与玻璃导航条同一圆角语言）
         Row(
@@ -840,6 +908,69 @@ private fun DiffView(diff: String) {
             )
         }
     }
+}
+
+/** 待审批紧凑条：一行摘要，点开底部弹层看完整卡片（数据源同审批 tab，应答在任一处生效）。 */
+@Composable
+private fun ApprovalStrip(approvals: List<PendingApproval>, modifier: Modifier = Modifier) {
+    var showSheet by remember { mutableStateOf(false) }
+    // 全部处理完（乐观移除/SSE resolved）时自动收起弹层
+    LaunchedEffect(approvals.size) {
+        if (approvals.isEmpty()) showSheet = false
+    }
+    val first = approvals.first()
+    Surface(
+        onClick = { showSheet = true },
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.tertiaryContainer,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(
+                Icons.Outlined.VerifiedUser,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onTertiaryContainer,
+                modifier = Modifier.size(16.dp),
+            )
+            Text(
+                if (approvals.size == 1) {
+                    "${kindLabel(first.kind)} · ${first.summary}"
+                } else {
+                    "${approvals.size} 项待处理 · ${kindLabel(first.kind)} 等"
+                },
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                "处理",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.tertiary,
+            )
+        }
+    }
+    if (showSheet) {
+        ModalBottomSheet(onDismissRequest = { showSheet = false }) {
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = ScreenPadding).padding(bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(BlockSpacing),
+            ) {
+                approvals.forEach { ApprovalCard(it) }
+            }
+        }
+    }
+}
+
+private fun kindLabel(kind: String): String = when (kind) {
+    "plan" -> "计划评审"
+    "ask" -> "提问"
+    else -> "授权请求"
 }
 
 // ---------- 审批卡片（permission / ask / plan） ----------

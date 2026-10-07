@@ -195,6 +195,11 @@ class SessionTimeline(
     private val _sendError = MutableStateFlow<String?>(null)
     val sendError: StateFlow<String?> = _sendError.asStateFlow()
 
+    /** 消费发送错误（Snackbar 展示后调用，避免同一条重复触发）。 */
+    fun consumeSendError() {
+        _sendError.value = null
+    }
+
     suspend fun send(text: String): CommandAck? {
         _sendError.value = null
         return try {

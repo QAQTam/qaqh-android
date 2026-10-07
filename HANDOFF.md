@@ -2,7 +2,17 @@
 
 给后续会话/接手者的交接说明。规划见 [PLAN.md](PLAN.md)。
 
-## 本轮收尾状态（2026-10-07 晚，接手者从这里继续）
+## 本轮收尾状态（2026-10-07 深夜，接手者从这里继续）
+
+- **聊天屏 P0 三件套落地（2026-10-07 深夜，编译 + 33 单测全绿，未真机）**：
+  ① **历史分页接线**：`loadOlder()` 此前无任何 UI 调用（长会话卡在最近 30 turn）。触发器 = `snapshotFlow { listState.firstVisibleItemIndex }` 收集，`didInitialJump && idx==0 && canScrollBackward && turns.isNotEmpty()` 四条件齐才 `timeline.loadOlder()`（didInitialJump 门控防进屏 pin 底前的空拉；前插后 LazyColumn 锚点保位、firstVisibleItemIndex 跳到新页尾，天然不会连环加载）。分页指示在**列表头部**（"加载更早…"/"加载更早失败，点按重试"），首屏空态仍留列表尾部。
+  ② **审批紧凑条**：聊天屏内 `approvals.forEach { ApprovalCard }` 换成单行 `ApprovalStrip`（tertiaryContainer 胶囊：图标 + "授权请求 · <摘要>"或"N 项待处理 · …" + "处理"），点开 ModalBottomSheet 看完整 ApprovalCard（全部处理完自动收层）。竖屏输入区上方不再整段让给卡片；审批 tab 的完整列表不变。数据源同 pendingApprovals，device/admin 两身份都走这条。
+  ③ **回到底部**：`derivedStateOf { listState.canScrollForward }` 驱动 AnimatedVisibility 悬浮 SmallFAB（右下、列表 Box 内），点击 `followBottom=true + pinToBottom`。流式被上翻打断、进屏未到底都能一键回底。
+  ④ 顺带：sendError/respondError 两行常驻错误文本改 **Snackbar**（`ConnectionService.consumeRespondError()` / `SessionTimeline.consumeSendError()` 消费式清空，防同一条重复触发）。
+  - 踩坑记录：Column 作用域里 `AnimatedVisibility` 会被 `ColumnScope.AnimatedVisibility`（androidx.compose.animation 的作用域重载）抢先解析——用全限定调用；委托 StateFlow 属性不能 smart-cast，先落 local val。
+- 待真机：长会话上翻分页（锚点保位验证）、审批条 + 弹层应答全链路、回到底部动画观感、Snackbar 两条错误流的触发。P0 清空后剩余 = P1 转场（SharedTransition）+ 大字号审计 + 输入栏玻璃化。
+
+## 上一轮：ActivityView 等待态本地推导（2026-10-07 晚）
 
 - **会话活动视图 ActivityView：等待态前端本地推导（2026-10-07 晚，33 单测 + verify 全绿，未真机）**：核实了后端状态语义的**三层真相**——① domain 层 ActivityState 六态（starting/idle/working/waiting_user/disconnected/failed，event.rs:90，桌面 webui 消费的就是它，ts-rs 已导出 ActivityState.ts）；② ringing v2 control 投影 activity **只有 idle|running|interrupted 三态**（session_fact_v2 types.rs:789），由 turn 事实驱动，**InteractionRequested 不改 activity、无 error 变体**——waiting/error 在安卓 SSE 通路上天然不存在；③ session.list 的 8 态 status 词表是 backend-fix worktree 未合入改动（clean 分支 wire 锁测试只有 running:bool + workspace_id），安卓 Home 里原来的 waiting_* 判定对当前 daemon 是死代码。
   - 落地（照抄桌面 projection.ts 范式）：`ui/home/SessionGrouping.kt` 新增 `ActivityView` 六值枚举（含 label）+ `activityViewOf(activity, pending)` 纯函数——pending 审批按 permission>ask>plan 优先级覆盖 activity 为等待态（桌面 projection.ts:398 同款：挂起交互 > 0 时前端覆盖 waiting_user）；"working"/"starting" 做防御性归并。SessionGroupingTest +1（5 项）。

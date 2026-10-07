@@ -593,6 +593,11 @@ class ConnectionService : Service() {
             _authRevoked.value = false
         }
 
+        /** 消费审批应答错误（Snackbar 展示后调用，避免同一条重复触发）。 */
+        fun consumeRespondError() {
+            _lastRespondError.value = null
+        }
+
         /** 审批应答：按 kind 分派；当前阶段仍用 canonical id（后端 M0 后换 opaque challenge id）。 */
         /**
          * device 身份的待审批投影源：GET /approvals 的 challenge 快照。
