@@ -65,7 +65,11 @@ class MainActivity : FragmentActivity() {
         }
         setContent {
             com.qaqh.harness.ui.theme.AppTheme {
-                AppRoot(Modifier)
+                // 根 Surface 必须保留：铺 colorScheme.background（否则 Light 窗口底漏出），
+                // 并提供 LocalContentColor=onSurface（缺失时 Text 回落纯黑，暗色下不可读）
+                androidx.compose.material3.Surface(Modifier.fillMaxSize()) {
+                    AppRoot(Modifier)
+                }
             }
         }
     }

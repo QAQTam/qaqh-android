@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 夜间模式窗口底：暗色方案下避免 Compose 首帧前/未铺满区域漏出亮白窗口底 -->
+<resources>
+    <style name="Theme.QAQHHarness" parent="android:Theme.Material.NoActionBar" />
+</resources>
