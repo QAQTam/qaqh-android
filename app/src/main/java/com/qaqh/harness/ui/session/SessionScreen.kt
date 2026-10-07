@@ -84,6 +84,7 @@ import com.qaqh.harness.data.ringing.model.TimelineTool
 import com.qaqh.harness.data.ringing.model.TimelineTurn
 import com.qaqh.harness.ui.home.ActivityView
 import com.qaqh.harness.ui.home.activityViewOf
+import com.qaqh.harness.ui.theme.AppMono
 import com.qaqh.harness.ui.approvals.authenticateForApproval
 import kotlinx.coroutines.launch
 
@@ -813,7 +814,7 @@ private fun ToolCard(tool: TimelineTool) {
                 body?.let { text ->
                     Text(
                         text,
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = com.qaqh.harness.ui.theme.AppMono),
                         maxLines = 200,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier
@@ -837,7 +838,7 @@ private fun ToolCard(tool: TimelineTool) {
                     tool.argsJson?.takeIf { it.isNotBlank() }?.let {
                         Text(
                             it,
-                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = com.qaqh.harness.ui.theme.AppMono),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 40,
                             overflow = TextOverflow.Ellipsis,
@@ -860,7 +861,7 @@ private fun ToolCard(tool: TimelineTool) {
                     lines.forEach { line ->
                         Text(
                             line,
-                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = com.qaqh.harness.ui.theme.AppMono),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
@@ -901,7 +902,7 @@ private fun DiffView(diff: String) {
             }
             Text(
                 line,
-                style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace),
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = com.qaqh.harness.ui.theme.AppMono),
                 color = color,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,

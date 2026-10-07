@@ -2,7 +2,17 @@
 
 给后续会话/接手者的交接说明。规划见 [PLAN.md](PLAN.md)。
 
-## 本轮收尾状态（2026-10-07 深夜，接手者从这里继续）
+## 本轮收尾状态（2026-10-08 凌晨，接手者从这里继续）
+
+- **四端统一字体嵌入——Android 端（2026-10-08 凌晨，编译 + 33 单测 + verify 全绿，未真机）**：要求 = 四端统一 **HarmonyOS Sans（正文/标题）+ Cascadia Code（等宽，连字符文件名 Cas-cadia? 无——是 "Cascadia Code"，文件名 CascadiaCode）**。四端现状：桌面 webui 已有（public/fonts/，SC 裁剪版 Regular+Bold + Cascadia woff2）、WinUI 已有（CascadiaCode.ttf/CascadiaMono.ttf）、HarmonyOS 系统自带、TUI 不适用（终端字体归用户）。
+  - Android 落地：`res/font/hmos_sans_sc_regular.ttf`(8.3M)/`hmos_sans_sc_bold.ttf`(8.2M)/`cascadia_code.ttf`(0.7M, 可变字体 wght 轴)——**直接复制桌面/WinUI 仓的同源文件**（桌面版 SC 是裁剪过的，SDK 全量 20.6M 不入包）；许可证副本在 `docs/fonts/`，出处/字重映射/各端状态在 `docs/fonts.md`。
+  - `Theme.kt`：新增 `AppSans`（W400/W500→Regular、W600/W700→Bold；官方 Medium 未随桌面仓分发，拿到后补 hmos_sans_sc_medium.ttf）+ `AppMono`（Cascadia 按 `FontVariation.weight` 取实例，minSdk 31 无 API 顾虑）+ M3 Typography **15 槽全量覆盖 fontFamily**（不逐槽设置 Roboto 会从默认样式漏进来）。
+  - 消费：聊天屏 4 处 `FontFamily.Monospace` → `AppMono`（工具卡输出/预览/原始参数/DiffView）；其余 UI 走 MaterialTheme.typography 自动获得 AppSans。
+  - APK 影响：debug +16.4MB → 111MB（debug 本来就肥：dex ~81M + 四套 ABI 的 ML Kit barhopper .so ~21M）；release + minify + abiFilters 后增量就是字体本身的 ~16M。若将来要瘦身：SC 按需子集化或动态下发（font provider），当前按四端一致性优先。
+  - Roborazzi 基线已重录（字体渲染必然变化），verifyRoborazziDebug 通过。
+- 待真机：中英混排观感（SC 裁剪版对生僻字/emoji 的回退到系统字体的表现）、Cascadia 在工具卡/diff 的字宽与可读性。**给其他端的提醒**：桌面端的 HarmonyOS Sans 若需要 Medium 字重，两端要同步补同一文件。
+
+## 上一轮：聊天屏 P0 三件套（2026-10-07 深夜）
 
 - **聊天屏 P0 三件套落地（2026-10-07 深夜，编译 + 33 单测全绿，未真机）**：
   ① **历史分页接线**：`loadOlder()` 此前无任何 UI 调用（长会话卡在最近 30 turn）。触发器 = `snapshotFlow { listState.firstVisibleItemIndex }` 收集，`didInitialJump && idx==0 && canScrollBackward && turns.isNotEmpty()` 四条件齐才 `timeline.loadOlder()`（didInitialJump 门控防进屏 pin 底前的空拉；前插后 LazyColumn 锚点保位、firstVisibleItemIndex 跳到新页尾，天然不会连环加载）。分页指示在**列表头部**（"加载更早…"/"加载更早失败，点按重试"），首屏空态仍留列表尾部。
