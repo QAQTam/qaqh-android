@@ -1,12 +1,13 @@
 package com.qaqh.harness.ui.home
 
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,7 +23,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -83,11 +83,16 @@ fun HomeScreen(
     val activity by ConnectionService.activity.collectAsState()
     val session by ConnectionService.sessionInfo.collectAsState()
     val sessions by ConnectionService.sessions.collectAsState()
+    val workspaces by ConnectionService.workspaces.collectAsState()
+    val refreshing by ConnectionService.refreshing.collectAsState()
     val scope = rememberCoroutineScope()
     var creating by remember { mutableStateOf(false) }
 
     // 进入列表屏立即刷新一次（不等 15s 兜底轮询）
     LaunchedEffect(Unit) { ConnectionService.refreshNow(scope) }
+
+    // 工作区分组（纯函数，分组/排序逻辑在 SessionGrouping.kt，有 JVM 单测）
+    val sections = remember(sessions, workspaces) { groupSessionsByWorkspace(sessions, workspaces) }
 
     fun createSession() {
         val conn = ConnectionService.activeConnection() ?: return
@@ -100,31 +105,19 @@ fun HomeScreen(
     }
 
     PullToRefreshBox(
-        isRefreshing = false,
+        isRefreshing = refreshing,
         onRefresh = { ConnectionService.refreshNow(scope) },
         state = rememberPullToRefreshState(),
         modifier = modifier.fillMaxSize(),
     ) {
         Box(Modifier.fillMaxSize()) {
-            LazyColumn(
-                contentPadding = PaddingValues(
-                    start = ScreenPadding,
-                    end = ScreenPadding,
-                    top = 12.dp,
-                    bottom = GlassNavBarContentPadding,
-                ),
-                verticalArrangement = Arrangement.spacedBy(BlockSpacing),
-            ) {
-                item { HomeHeader(state, Modifier.fillMaxWidth()) }
-
-                val list = if (sessions.isEmpty() && session != null) listOfNotNull(session) else sessions
-                items(list, key = { it.sessionId }) { entry ->
-                    SessionCard(activity, entry, Modifier.fillMaxWidth()) { onOpenSession(entry.sessionId) }
-                }
-                if (list.isEmpty()) {
-                    item { EmptySessions(Modifier.fillMaxWidth()) }
-                }
-            }
+            HomeList(
+                state = state,
+                activity = activity,
+                sections = sections,
+                onOpenSession = onOpenSession,
+                modifier = Modifier.fillMaxSize(),
+            )
             ExtendedFloatingActionButton(
                 onClick = {
                     if (!creating && state is RingingConnection.State.Connected) createSession()
@@ -134,6 +127,76 @@ fun HomeScreen(
                     .align(Alignment.BottomEnd)
                     .padding(end = ScreenPadding, bottom = GlassNavBarContentPadding - 24.dp),
             ) { Text(if (creating) "创建中…" else "新建会话") }
+        }
+    }
+}
+
+/**
+ * 首页列表（工作区分组 + sticky header）；与连接状态解耦，Roborazzi 预览/截图测试直接喂假数据。
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun HomeList(
+    state: RingingConnection.State,
+    activity: String?,
+    sections: List<SessionSection>,
+    onOpenSession: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    LazyColumn(
+        contentPadding = PaddingValues(
+            start = ScreenPadding,
+            end = ScreenPadding,
+            top = 12.dp,
+            bottom = GlassNavBarContentPadding,
+        ),
+        verticalArrangement = Arrangement.spacedBy(BlockSpacing),
+        modifier = modifier,
+    ) {
+        item { HomeHeader(state, Modifier.fillMaxWidth()) }
+
+        if (sections.isEmpty()) {
+            item { EmptySessions(Modifier.fillMaxWidth()) }
+        }
+        sections.forEach { section ->
+            // sticky：长列表滚动时工作区头常驻，扫读锚点
+            stickyHeader(key = "hdr-${section.workspaceId ?: "-"}") {
+                SectionHeader(section)
+            }
+            items(section.sessions, key = { it.sessionId }) { entry ->
+                SessionCard(activity, entry, Modifier.fillMaxWidth()) { onOpenSession(entry.sessionId) }
+            }
+        }
+    }
+}
+
+/** 工作区分区头：标题 + 会话数；目录缺失的工作区做降级提示。 */
+@Composable
+private fun SectionHeader(section: SessionSection) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            section.title,
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        Text(
+            "${section.sessions.size}",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (section.missingDir) {
+            Text(
+                "· 目录缺失",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.error,
+            )
         }
     }
 }
@@ -186,8 +249,8 @@ private fun EmptySessions(modifier: Modifier = Modifier) {
 }
 
 /**
- * 会话卡片（M3 Expressive 大圆角 tonal 卡）：摘要做主标题，ULID 降为元信息；
- * 状态 = 彩色点 + 文案（运行中有呼吸动画），不再用描边胶囊。
+ * 会话卡片（M3 Expressive 大圆角 tonal 卡）：LLM 生成的工作区标题做主标题，
+ * 相对时间进 meta 行；状态 = 彩色点 + 文案（运行中有呼吸动画）。
  */
 @Composable
 private fun SessionCard(
@@ -227,15 +290,14 @@ private fun SessionCard(
                     color = if (running) ap.color else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    "· ${session.model ?: "未知模型"}",
+                    relativeTimeLabel(session.updatedAt, System.currentTimeMillis()),
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.End,
                 )
             }
-            // 标题契约：title（新 daemon）→ last_summary（旧 daemon）→ 兜底
+            // 标题契约：title（后端 LLM 生成，第一句话占位 → 异步冻结替换）→ 兜底
             val summary = session.displayTitle
             Text(
                 summary ?: "未命名会话",
@@ -245,7 +307,7 @@ private fun SessionCard(
                 modifier = Modifier.alpha(if (summary == null) 0.6f else 1f),
             )
             Text(
-                "${session.sessionId.take(12)}… · ${session.turnCount} 轮",
+                "${session.model ?: "未知模型"} · ${session.turnCount} 轮",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
@@ -281,4 +343,37 @@ private fun RunningDot(running: Boolean, ap: ActivityPresentation) {
                 .background(ap.color)
         )
     }
+}
+
+/** 预览/截图喂假数据的样例分区（Roborazzi 基线用它；真机走真实 flow）。 */
+internal fun sampleSections(): List<SessionSection> {
+    fun entry(id: String, ws: String?, updatedAt: Long, title: String) =
+        com.qaqh.harness.data.ringing.model.SessionListEntry(
+            sessionId = id,
+            updatedAt = updatedAt,
+            model = "glm-4.7",
+            title = title,
+            turnCount = 3,
+            status = "idle",
+            workspaceId = ws,
+        )
+    return listOf(
+        SessionSection(
+            workspaceId = "ws-a",
+            title = "qaqh-backend",
+            missingDir = false,
+            sessions = listOf(
+                entry("s2", "ws-a", (System.currentTimeMillis() - 90_000) / 1000, "重构 ringing v2 的 SSE 帧解码"),
+                entry("s1", "ws-a", (System.currentTimeMillis() - 3_600_000) / 1000, "修复 bootstrap 409 租约风暴"),
+            ),
+        ),
+        SessionSection(
+            workspaceId = null,
+            title = "未分组",
+            missingDir = false,
+            sessions = listOf(
+                entry("s3", null, (System.currentTimeMillis() - 86_400_000) / 1000, "调查 ColorOS 胶囊通知被合并的问题"),
+            ),
+        ),
+    )
 }

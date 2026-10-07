@@ -11,6 +11,7 @@ import com.qaqh.harness.data.ringing.model.RenewResponse
 import com.qaqh.harness.data.ringing.model.ResetRequired
 import com.qaqh.harness.data.ringing.model.RingingProtocol
 import com.qaqh.harness.data.ringing.model.SessionListEntry
+import com.qaqh.harness.data.ringing.model.WorkspaceEntry
 import com.qaqh.harness.data.ringing.model.TimelineEntryEnvelope
 import com.qaqh.harness.data.ringing.model.TimelineEntryFrame
 import com.qaqh.harness.data.ringing.model.TimelineResponse
@@ -233,6 +234,13 @@ class RingingApi(
     /** POST /service/session.list — 会话列表（单活跃流模式的发现来源）。 */
     fun sessionList(clientSessionId: String): List<SessionListEntry> = execute(
         requestBuilder("/service/session.list", clientSessionId)
+            .post(EMPTY_JSON.toRequestBody(jsonMedia))
+            .build()
+    )
+
+    /** POST /service/workspace.list — UI 工作区注册表（Home 分组；读操作，view+scope 可用）。 */
+    fun workspaceList(clientSessionId: String): List<WorkspaceEntry> = execute(
+        requestBuilder("/service/workspace.list", clientSessionId)
             .post(EMPTY_JSON.toRequestBody(jsonMedia))
             .build()
     )

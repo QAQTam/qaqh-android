@@ -315,6 +315,20 @@ data class SessionListEntry(
 
 private val approvalJson = Json { ignoreUnknownKeys = true }
 
+/**
+ * `POST /service/workspace.list` 条目（qaqh-session grouping.rs WorkspaceMeta + missing_dir）。
+ * UI 工作区注册表：组织语义（Home 分组的 section 来源）；title 默认 = 目录名，桌面端可改名。
+ */
+@Serializable
+data class WorkspaceEntry(
+    val id: String,
+    val path: String,
+    val title: String,
+    val order: Int = 0,
+    @SerialName("session_ids") val sessionIds: List<String> = emptyList(),
+    @SerialName("missing_dir") val missingDir: Boolean = false,
+)
+
 // ---------- approvals ----------
 
 /**

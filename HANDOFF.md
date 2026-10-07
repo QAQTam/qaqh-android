@@ -2,7 +2,17 @@
 
 给后续会话/接手者的交接说明。规划见 [PLAN.md](PLAN.md)。
 
-## 本轮收尾状态（2026-10-07，接手者从这里继续）
+## 本轮收尾状态（2026-10-07 下午，接手者从这里继续）
+
+- **Home 信息架构重做：工作区分组（2026-10-07 下午，assembleDebug + 34 单测 + Roborazzi verify 全绿，未真机）**：针对"long 列表无工作区语义"的反馈。结论先行：单列 LazyColumn 是对的（虚拟化），问题在信息架构——已改为**按工作区分组的 sticky 分区列表**：
+  - 新服务接入：`POST /service/workspace.list`（daemon 端 qaqh-runtime service.rs 已有，返回 `{id,path,title,order,session_ids,missing_dir}`，title 默认=目录名、桌面可改名）→ `RingingApi.workspaceList()` + `WorkspaceEntry` 模型；`ConnectionService.refreshSessions` 顺带拉取（失败静默，旧 daemon 退化为单 section）→ `workspaces`/`refreshing` 两个 StateFlow；
+  - `ui/home/SessionGrouping.kt` 纯函数：`groupSessionsByWorkspace`（未分组置顶、workspace_id 死引用归未分组、空工作区不出幽灵 section、order 排序、分区内 updated_at 降序）+ `relativeTimeLabel`（**updated_at 是 epoch 秒**，manager.rs now_epoch=as_secs()）；SessionGroupingTest 4 项；
+  - HomeScreen 重写：sticky 分区头（foundation 新版里 stickyHeader 是 LazyListScope 接口成员，**不要 import**）+ 卡片 meta 行加相对时间右对齐 + 下拉刷新接真实 refreshing 状态（原来写死 false 无反馈）；`HomeList` 与连接状态解耦，截图测试直接喂 `sampleSections()` 假数据。
+- **title 来源结论（用户问"为什么还是第一句话"）**：后端 qaqh-title 管线 = 首条用户消息到达时同步写"截断首句"占位 → 后台 LLM 总结异步生成并 emit title_changed 冻结替换（engine_title.rs）。安卓 `displayTitle` 本来就优先 `title` 字段——手机上只看到首句占位说明 **LLM 总结没跑成**（title gate 走 BYOK provider，查 daemon 侧 provider 配置/日志），前端选词无需改。
+- **Roborazzi 截图回归已接入（试运行成功）**：`io.github.takahirom.roborazzi` 1.76.0（gradlePluginPortal）+ robolectric 4.17 + compose ui-test-junit4（BOM 管版本）+ androidx.test.ext:junit 1.3.0（google maven）；`testOptions.unitTests.isIncludeAndroidResources = true`。`HomeSectionsScreenshotTest`（SDK 35、NATIVE graphics）渲染工作区分组出基线 `app/src/test/screenshots/home_sections.png`（已入库）。**流程 = 改 UI 后 `./gradlew recordRoborazziDebug` 记基线、`./gradlew verifyRoborazziDebug` 回归比对**；手机充电时也能做组件级视觉迭代。注意：JDK 25 下 Robolectric native runtime 打 restricted-method 警告（无害）；`createComposeRule` 有 deprecated 提示（建议迁 androidx.compose.ui.test.junit4.v2，下轮顺手换）。
+- **P0 剩余（下轮）**：① 聊天屏历史分页接线（`loadOlder()` 仍无 UI 调用，长会话卡在最近 30 turn）；② 审批卡收紧凑条（现占输入区上方黄金空间，device 身份下 challenge 可能多条）；③ 回到底部悬浮钮；④ sticky 头在玻璃条/深色下的真机观感。
+
+## 上一轮：连接层重连统一 + device challenge 流（2026-10-07 上午）
 
 - **连接层重连路径统一 + bootstrap 未物化保租约（2026-10-07，assembleDebug + 26 单测全绿，未真机）**：本轮针对 HANDOFF 旧痛点"空会话期间 bootstrap 409 风暴每秒轮换租约 → 旧租约 timeline SSE 全部 401"做根治，形态对照 Rust qaqh-client（v2_stream.rs / error.rs）：
   ① `RingingConnection.streamEvents`：bootstrap 404/409（session_not_found/snapshot_missing）改为**保持租约 1s 短退避重试**（新 `bootstrapSnapshot` 内部循环，对齐 Rust v2_stream 的 not-ready 短退避），不再逃回整轮 connectOnce 重开——租约稳定后 timeline SSE/待办跟踪器不再被殃及；

@@ -454,6 +454,13 @@ class ConnectionService : Service() {
         private val _sessions = MutableStateFlow<List<com.qaqh.harness.data.ringing.model.SessionListEntry>>(emptyList())
         val sessions: StateFlow<List<com.qaqh.harness.data.ringing.model.SessionListEntry>> = _sessions.asStateFlow()
 
+        private val _workspaces = MutableStateFlow<List<com.qaqh.harness.data.ringing.model.WorkspaceEntry>>(emptyList())
+        val workspaces: StateFlow<List<com.qaqh.harness.data.ringing.model.WorkspaceEntry>> = _workspaces.asStateFlow()
+
+        private val _refreshing = MutableStateFlow(false)
+        /** 手动/进入时刷新是否进行中（Home 下拉指示器接此状态）。 */
+        val refreshing: StateFlow<Boolean> = _refreshing.asStateFlow()
+
         /** 立即刷新会话列表（进入列表屏/下拉刷新时调用）；未连接时等连接就绪后再拉（最多等 10s）。 */
         fun refreshNow(scope: kotlinx.coroutines.CoroutineScope) {
             val conn = connection ?: return
@@ -462,7 +469,9 @@ class ConnectionService : Service() {
                 if (withTimeoutOrNull(10_000) { conn.state.first { it is RingingConnection.State.Connected } } == null) {
                     return@launch
                 }
+                _refreshing.value = true
                 refreshSessions(conn)
+                _refreshing.value = false
             }
         }
 
@@ -478,6 +487,11 @@ class ConnectionService : Service() {
             val visible = sessions.filterNot { it.sessionId.startsWith(".") }
             android.util.Log.i("ConnectionService", "sessions: ${sessions.size} raw, ${visible.size} visible")
             _sessions.value = visible
+            // 工作区注册表：读接口，失败静默（旧 daemon 无此方法；Home 退化为单 section）
+            val workspaces = runCatching { withTimeoutOrNull(10_000) { conn.api.workspaceList(sid) } }
+                .onFailure { android.util.Log.w(TAG, "workspaceList failed: $it") }
+                .getOrNull()
+            if (workspaces != null) _workspaces.value = workspaces
             return visible
         }
 
