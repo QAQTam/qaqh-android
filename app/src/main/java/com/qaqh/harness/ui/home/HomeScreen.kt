@@ -40,10 +40,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qaqh.harness.connection.ConnectionService
+import com.qaqh.harness.connection.PendingApproval
 import com.qaqh.harness.data.pairing.StoredCredentials
 import com.qaqh.harness.data.ringing.RingingConnection
 import com.qaqh.harness.ui.nav.GlassNavBarContentPadding
@@ -56,23 +58,6 @@ private val CardInnerPadding = 16.dp
 private val CardCorner = 24.dp
 private val StatusDotSize = 10.dp
 
-/** 会话活动状态 → 状态点颜色/文案。 */
-private data class ActivityPresentation(val color: androidx.compose.ui.graphics.Color, val label: String)
-
-@Composable
-private fun presentActivity(state: String?): ActivityPresentation = when (state) {
-    "running", "working" -> ActivityPresentation(MaterialTheme.colorScheme.primary, "工作中")
-    "idle" -> ActivityPresentation(MaterialTheme.colorScheme.outline, "空闲")
-    "interrupted", "canceled" -> ActivityPresentation(MaterialTheme.colorScheme.error, "已中断")
-    // session.list 新词表的等待态（backend-fix 后 status 取代 running:bool）
-    "waiting_permission" -> ActivityPresentation(MaterialTheme.colorScheme.tertiary, "等待授权")
-    "waiting_ask" -> ActivityPresentation(MaterialTheme.colorScheme.tertiary, "等待回答")
-    "waiting_plan" -> ActivityPresentation(MaterialTheme.colorScheme.tertiary, "等待评审")
-    "error" -> ActivityPresentation(MaterialTheme.colorScheme.error, "出错")
-    null, "not_running" -> ActivityPresentation(MaterialTheme.colorScheme.outline, "无活动")
-    else -> ActivityPresentation(MaterialTheme.colorScheme.tertiary, state)
-}
-
 @Composable
 fun HomeScreen(
     credentials: StoredCredentials,
@@ -81,7 +66,7 @@ fun HomeScreen(
 ) {
     val state by ConnectionService.connectionState.collectAsState()
     val activity by ConnectionService.activity.collectAsState()
-    val session by ConnectionService.sessionInfo.collectAsState()
+    val pending by ConnectionService.pendingApprovals.collectAsState()
     val sessions by ConnectionService.sessions.collectAsState()
     val workspaces by ConnectionService.workspaces.collectAsState()
     val refreshing by ConnectionService.refreshing.collectAsState()
@@ -114,6 +99,7 @@ fun HomeScreen(
             HomeList(
                 state = state,
                 activity = activity,
+                pending = pending,
                 sections = sections,
                 onOpenSession = onOpenSession,
                 modifier = Modifier.fillMaxSize(),
@@ -131,6 +117,18 @@ fun HomeScreen(
     }
 }
 
+/** 活动视图 → 状态点颜色（等待态用 tertiary 提示"需要你"，出错/中断 error，空闲 outline）。 */
+@Composable
+private fun activityColor(view: ActivityView): Color = when (view) {
+    ActivityView.WORKING -> MaterialTheme.colorScheme.primary
+    ActivityView.IDLE -> MaterialTheme.colorScheme.outline
+    ActivityView.INTERRUPTED -> MaterialTheme.colorScheme.error
+    ActivityView.WAITING_PERMISSION,
+    ActivityView.WAITING_ASK,
+    ActivityView.WAITING_PLAN,
+    -> MaterialTheme.colorScheme.tertiary
+}
+
 /**
  * 首页列表（工作区分组 + sticky header）；与连接状态解耦，Roborazzi 预览/截图测试直接喂假数据。
  */
@@ -139,6 +137,7 @@ fun HomeScreen(
 fun HomeList(
     state: RingingConnection.State,
     activity: String?,
+    pending: List<PendingApproval>,
     sections: List<SessionSection>,
     onOpenSession: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -164,7 +163,7 @@ fun HomeList(
                 SectionHeader(section)
             }
             items(section.sessions, key = { it.sessionId }) { entry ->
-                SessionCard(activity, entry, Modifier.fillMaxWidth()) { onOpenSession(entry.sessionId) }
+                SessionCard(activity, pending, entry, Modifier.fillMaxWidth()) { onOpenSession(entry.sessionId) }
             }
         }
     }
@@ -250,24 +249,22 @@ private fun EmptySessions(modifier: Modifier = Modifier) {
 
 /**
  * 会话卡片（M3 Expressive 大圆角 tonal 卡）：LLM 生成的工作区标题做主标题，
- * 相对时间进 meta 行；状态 = 彩色点 + 文案（运行中有呼吸动画）。
+ * 相对时间进 meta 行；状态 = 活动视图（等待态由 pending 审批本地推导）+ 呼吸点。
  */
 @Composable
 private fun SessionCard(
     activity: String?,
+    pending: List<PendingApproval>,
     session: com.qaqh.harness.data.ringing.model.SessionListEntry,
     modifier: Modifier = Modifier,
     onClick: () -> Unit = {},
 ) {
-    // 状态来源优先级：会话执行中（新旧 daemon 兼容判定）> control activity > status 词表等待态
-    val running = session.isWorking || activity == "running"
-    val displayState = when {
-        running -> "running"
-        session.runStatus.startsWith("waiting_") -> session.runStatus
-        session.runStatus == "error" -> "error"
-        else -> activity
-    }
-    val ap = presentActivity(displayState)
+    val view = activityViewOf(activity, pending)
+    // 需要用户介入（等待授权/回答/评审）与执行中一样用呼吸点——都是"有事发生"
+    val attention = view == ActivityView.WORKING ||
+        view == ActivityView.WAITING_PERMISSION ||
+        view == ActivityView.WAITING_ASK ||
+        view == ActivityView.WAITING_PLAN
     Card(
         modifier = modifier.clickable(onClick = onClick, role = Role.Button),
         shape = RoundedCornerShape(CardCorner),
@@ -283,11 +280,11 @@ private fun SessionCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                RunningDot(running, ap)
+                RunningDot(attention, activityColor(view))
                 Text(
-                    ap.label,
+                    view.label,
                     style = MaterialTheme.typography.labelMedium,
-                    color = if (running) ap.color else MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (attention) activityColor(view) else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
                     relativeTimeLabel(session.updatedAt, System.currentTimeMillis()),
@@ -317,9 +314,9 @@ private fun SessionCard(
     }
 }
 
-/** 运行中 = 呼吸动画的状态点；否则静态点。 */
+/** 需要注意时 = 呼吸动画的状态点；否则静态点。 */
 @Composable
-private fun RunningDot(running: Boolean, ap: ActivityPresentation) {
+private fun RunningDot(running: Boolean, color: Color) {
     if (running) {
         val transition = rememberInfiniteTransition(label = "runningDot")
         val alpha by transition.animateFloat(
@@ -333,14 +330,14 @@ private fun RunningDot(running: Boolean, ap: ActivityPresentation) {
                 .size(StatusDotSize)
                 .alpha(alpha)
                 .clip(CircleShape)
-                .background(ap.color)
+                .background(color)
         )
     } else {
         Box(
             Modifier
                 .size(StatusDotSize)
                 .clip(CircleShape)
-                .background(ap.color)
+                .background(color)
         )
     }
 }

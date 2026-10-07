@@ -1,9 +1,37 @@
 package com.qaqh.harness.ui.home
 
+import com.qaqh.harness.connection.PendingApproval
+import com.qaqh.harness.data.ringing.model.InteractionKinds
 import com.qaqh.harness.data.ringing.model.SessionListEntry
 import com.qaqh.harness.data.ringing.model.WorkspaceEntry
 import java.time.Instant
 import java.time.ZoneId
+
+/**
+ * 首页/聊天头共用的会话活动视图。后端 control 投影的 activity 只有
+ * idle|running|interrupted 三态（session_fact_v2 types.rs），交互挂起不改 activity、
+ * 无 error 变体——`waiting_*` 由前端本地推导（对齐桌面 projection.ts:398：
+ * pending interactions > 0 时覆盖为等待态）。error 属后端 gap（投影无 Failed 臂），
+ * 本视图暂不含。
+ */
+enum class ActivityView(val label: String) {
+    WORKING("工作中"),
+    IDLE("空闲"),
+    INTERRUPTED("已中断"),
+    WAITING_PERMISSION("等待授权"),
+    WAITING_ASK("等待回答"),
+    WAITING_PLAN("等待评审"),
+}
+
+/** activity（投影三态；"working"/"starting" 为 domain 词表的防御性归并）+ 待审批 → 活动视图。 */
+fun activityViewOf(activity: String?, pending: List<PendingApproval>): ActivityView = when {
+    pending.any { it.kind == InteractionKinds.PERMISSION } -> ActivityView.WAITING_PERMISSION
+    pending.any { it.kind == InteractionKinds.ASK } -> ActivityView.WAITING_ASK
+    pending.any { it.kind == InteractionKinds.PLAN } -> ActivityView.WAITING_PLAN
+    activity == "running" || activity == "working" || activity == "starting" -> ActivityView.WORKING
+    activity == "interrupted" -> ActivityView.INTERRUPTED
+    else -> ActivityView.IDLE
+}
 
 /** 首页分区：一个工作区（或未分组）下的会话集合，updated_at 降序。 */
 data class SessionSection(

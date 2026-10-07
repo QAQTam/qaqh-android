@@ -70,6 +70,8 @@ import com.qaqh.harness.data.ringing.SessionTimeline
 import com.qaqh.harness.data.ringing.model.TimelineBlock
 import com.qaqh.harness.data.ringing.model.TimelineTool
 import com.qaqh.harness.data.ringing.model.TimelineTurn
+import com.qaqh.harness.ui.home.ActivityView
+import com.qaqh.harness.ui.home.activityViewOf
 import com.qaqh.harness.ui.approvals.authenticateForApproval
 import kotlinx.coroutines.launch
 
@@ -195,12 +197,8 @@ fun SessionScreen(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                val activityText = when (activity) {
-                    "running" -> "工作中"
-                    "idle" -> "空闲"
-                    "interrupted" -> "已中断"
-                    else -> activity ?: ""
-                }
+                // 等待态由待审批本地推导（后端 control 投影 activity 只有三态）
+                val view = activityViewOf(activity, approvals)
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     entry?.model?.let { model ->
                         Text(
@@ -213,9 +211,17 @@ fun SessionScreen(
                         Text("·", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Text(
-                        activityText,
+                        view.label,
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (activity == "running") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = when (view) {
+                            ActivityView.WORKING -> MaterialTheme.colorScheme.primary
+                            ActivityView.WAITING_PERMISSION,
+                            ActivityView.WAITING_ASK,
+                            ActivityView.WAITING_PLAN,
+                            -> MaterialTheme.colorScheme.tertiary
+                            ActivityView.INTERRUPTED -> MaterialTheme.colorScheme.error
+                            ActivityView.IDLE -> MaterialTheme.colorScheme.onSurfaceVariant
+                        },
                     )
                 }
             }

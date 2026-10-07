@@ -4,6 +4,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onRoot
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.github.takahirom.roborazzi.captureRoboImage
+import com.qaqh.harness.connection.PendingApproval
 import com.qaqh.harness.data.ringing.RingingConnection
 import com.qaqh.harness.ui.theme.AppTheme
 import org.junit.Rule
@@ -31,12 +32,37 @@ class HomeSectionsScreenshotTest {
                 HomeList(
                     state = RingingConnection.State.Connected("epoch-1", "cs-1"),
                     activity = "running",
+                    pending = emptyList(),
                     sections = sampleSections(),
                     onOpenSession = {},
                 )
             }
         }
-        composeRule.waitUntil(5_000) { true }
         composeRule.onRoot().captureRoboImage("src/test/screenshots/home_sections.png")
+    }
+
+    @Test
+    fun homeWaitingPermissionBaseline() {
+        composeRule.setContent {
+            AppTheme {
+                HomeList(
+                    state = RingingConnection.State.Connected("epoch-1", "cs-1"),
+                    activity = "running",
+                    pending = listOf(
+                        // permission 挂起 → 卡片应显示"等待授权"（本地推导，非后端下发）
+                        PendingApproval(
+                            interactionId = "int-1",
+                            kind = "permission",
+                            callId = null,
+                            summary = "同意执行 rm -rf /tmp/x",
+                            expiresAtMs = null,
+                        ),
+                    ),
+                    sections = sampleSections(),
+                    onOpenSession = {},
+                )
+            }
+        }
+        composeRule.onRoot().captureRoboImage("src/test/screenshots/home_waiting.png")
     }
 }

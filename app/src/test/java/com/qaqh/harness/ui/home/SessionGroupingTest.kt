@@ -69,4 +69,26 @@ class SessionGroupingTest {
         // 更早 → 日期
         assertEquals(relativeTimeLabel(now / 1000 - 30 * 86_400, now), relativeTimeLabel(now / 1000 - 30 * 86_400, now))
     }
+
+    @Test
+    fun `waiting states are derived from pending approvals`() {
+        fun approval(kind: String) = com.qaqh.harness.connection.PendingApproval(
+            interactionId = "i", kind = kind, callId = null, summary = "s", expiresAtMs = null,
+        )
+        // 交互挂起覆盖执行中（control 投影在 interaction 期间仍报 running）
+        assertEquals(ActivityView.WAITING_PERMISSION, activityViewOf("running", listOf(approval("permission"))))
+        assertEquals(ActivityView.WAITING_ASK, activityViewOf("running", listOf(approval("ask"))))
+        assertEquals(ActivityView.WAITING_PLAN, activityViewOf("running", listOf(approval("plan"))))
+        // 多条并存：授权 > 回答 > 评审（需要用户介入的紧急度排序）
+        assertEquals(
+            ActivityView.WAITING_PERMISSION,
+            activityViewOf("running", listOf(approval("plan"), approval("permission"))),
+        )
+        // 无挂起 → 投影三态映射（含 domain 词表防御性归并）
+        assertEquals(ActivityView.WORKING, activityViewOf("running", emptyList()))
+        assertEquals(ActivityView.WORKING, activityViewOf("working", emptyList()))
+        assertEquals(ActivityView.INTERRUPTED, activityViewOf("interrupted", emptyList()))
+        assertEquals(ActivityView.IDLE, activityViewOf("idle", emptyList()))
+        assertEquals(ActivityView.IDLE, activityViewOf(null, emptyList()))
+    }
 }

@@ -2,7 +2,15 @@
 
 给后续会话/接手者的交接说明。规划见 [PLAN.md](PLAN.md)。
 
-## 本轮收尾状态（2026-10-07 下午，接手者从这里继续）
+## 本轮收尾状态（2026-10-07 晚，接手者从这里继续）
+
+- **会话活动视图 ActivityView：等待态前端本地推导（2026-10-07 晚，33 单测 + verify 全绿，未真机）**：核实了后端状态语义的**三层真相**——① domain 层 ActivityState 六态（starting/idle/working/waiting_user/disconnected/failed，event.rs:90，桌面 webui 消费的就是它，ts-rs 已导出 ActivityState.ts）；② ringing v2 control 投影 activity **只有 idle|running|interrupted 三态**（session_fact_v2 types.rs:789），由 turn 事实驱动，**InteractionRequested 不改 activity、无 error 变体**——waiting/error 在安卓 SSE 通路上天然不存在；③ session.list 的 8 态 status 词表是 backend-fix worktree 未合入改动（clean 分支 wire 锁测试只有 running:bool + workspace_id），安卓 Home 里原来的 waiting_* 判定对当前 daemon 是死代码。
+  - 落地（照抄桌面 projection.ts 范式）：`ui/home/SessionGrouping.kt` 新增 `ActivityView` 六值枚举（含 label）+ `activityViewOf(activity, pending)` 纯函数——pending 审批按 permission>ask>plan 优先级覆盖 activity 为等待态（桌面 projection.ts:398 同款：挂起交互 > 0 时前端覆盖 waiting_user）；"working"/"starting" 做防御性归并。SessionGroupingTest +1（5 项）。
+  - 消费：Home 卡片状态行 = 视图驱动（等待态 tertiary 色呼吸点、工作中 primary、中断 error、空闲 outline），"working/working 归并"原 presentActivity 已删；聊天屏头部同步用 ActivityView（词表原本就对，只是加了等待态）。Roborazzi 新增 `home_waiting.png` 基线（activity=running + permission 挂起 → 卡片显示"等待授权"）。
+  - **error 语义是后端 gap，已具备反馈材料**：control 投影没有 Failed 投影臂（TurnFailed 事实无对应处理，TurnFinished/TurnInterrupted 只收敛到 Idle/Interrupted），两端 SSE 通路都拿不到实时错误态。建议后端：control 投影补 Failed 变体（TurnStarted→Running / TurnFinished→Idle / **TurnFailed→Failed** / TurnInterrupted→Interrupted），wire 三态扩四态，桌面 projection.ts 的 ACTIVITY_FROM_PROJECTION 映射表缺项即编译错误会自动暴露。
+- 本轮提交 6bfc3ca（Home 工作区分组）之后追加本轮改动；待办仍见上节 P0 剩余（历史分页接线、审批紧凑条、回到底部）。
+
+## 上一轮：Home 工作区分组 + Roborazzi（2026-10-07 下午）
 
 - **Home 信息架构重做：工作区分组（2026-10-07 下午，assembleDebug + 34 单测 + Roborazzi verify 全绿，未真机）**：针对"long 列表无工作区语义"的反馈。结论先行：单列 LazyColumn 是对的（虚拟化），问题在信息架构——已改为**按工作区分组的 sticky 分区列表**：
   - 新服务接入：`POST /service/workspace.list`（daemon 端 qaqh-runtime service.rs 已有，返回 `{id,path,title,order,session_ids,missing_dir}`，title 默认=目录名、桌面可改名）→ `RingingApi.workspaceList()` + `WorkspaceEntry` 模型；`ConnectionService.refreshSessions` 顺带拉取（失败静默，旧 daemon 退化为单 section）→ `workspaces`/`refreshing` 两个 StateFlow；
