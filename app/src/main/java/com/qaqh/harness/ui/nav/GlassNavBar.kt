@@ -64,7 +64,8 @@ import kotlin.math.roundToInt
 private val BarHeight = 64.dp
 private val BarHorizontalMargin = 28.dp
 private val LensCorner = 26.dp
-private val ContentBottomClearance = 104.dp // 列表内容为悬浮条预留的底部净空
+private val ContentBottomClearance = 118.dp // 列表内容为悬浮条预留的底部净空
+private val BarBottomLift = 22.dp // 条底离屏幕底的抬升（真机反馈：原 8dp 太低，抬高 ~50 物理px @3.5x）
 /** 拖动时透镜最大拉伸比例（squash & stretch 质感）。 */
 private const val MAX_STRETCH = 0.06f
 
@@ -135,7 +136,7 @@ fun GlassNavBar(
                 .padding(horizontal = BarHorizontalMargin)
                 .fillMaxWidth()
                 .height(BarHeight)
-                .offset(y = (-8).dp)
+                .offset(y = -BarBottomLift)
                 .zIndex(1f)
                 .shadow(18.dp, CircleShape, ambientColor = Color.Black.copy(alpha = 0.25f))
                 .clip(CircleShape)
