@@ -1,6 +1,7 @@
 package com.qaqh.harness.ui.settings
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,7 +21,11 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -125,7 +130,29 @@ fun SettingsScreen(
             }
         }
         SettingSection("关于") {
-            SettingRow("版本", BuildConfig.VERSION_NAME)
+            // 彩蛋式调试入口：版本行 2 秒内连点 5 次切换内存探针
+            var tapCount by remember { mutableIntStateOf(0) }
+            var lastTapMs by remember { mutableLongStateOf(0L) }
+            var showMemProbe by remember { mutableStateOf(false) }
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val now = System.currentTimeMillis()
+                        tapCount = if (now - lastTapMs < 2000) tapCount + 1 else 1
+                        lastTapMs = now
+                        if (tapCount >= 5) {
+                            showMemProbe = !showMemProbe
+                            tapCount = 0
+                        }
+                    }
+                    .padding(vertical = 8.dp),
+            ) {
+                SettingRow("版本", BuildConfig.VERSION_NAME + if (showMemProbe) " ·探针开" else "")
+            }
+            if (showMemProbe) {
+                MemoryProbePanel()
+            }
         }
         Button(
             onClick = onUnpair,
@@ -151,9 +178,88 @@ private fun SettingSection(title: String, content: @Composable () -> Unit) {
     }
 }
 
+/** 一次内存采样（单位统一 MB 渲染；PSS 来自 Debug.MemoryInfo，kB 字段）。 */
+private class MemSample(
+    pssTotalKb: Int,
+    pssJavaKb: Int,
+    pssNativeKb: Int,
+    javaUsed: Long,
+    javaMax: Long,
+    sysAvail: Long,
+    sysTotal: Long,
+    val lowMemory: Boolean,
+) {
+    val pssTotal = pssTotalKb / 1024f
+    val pssJava = pssJavaKb / 1024f
+    val pssNative = pssNativeKb / 1024f
+    val pssOther = (pssTotalKb - pssJavaKb - pssNativeKb).coerceAtLeast(0) / 1024f
+    val javaUsedMb = javaUsed / 1048576f
+    val javaMaxMb = javaMax / 1048576f
+    val sysAvailMb = sysAvail / 1048576f
+    val sysTotalMb = sysTotal / 1048576f
+}
+
+private fun sampleMemory(context: android.content.Context): MemSample {
+    val am = context.getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+    val dbg = android.os.Debug.MemoryInfo()
+    android.os.Debug.getMemoryInfo(dbg)
+    val rt = Runtime.getRuntime()
+    val sys = android.app.ActivityManager.MemoryInfo()
+    am.getMemoryInfo(sys)
+    return MemSample(
+        pssTotalKb = dbg.totalPss,
+        pssJavaKb = dbg.dalvikPss,
+        pssNativeKb = dbg.nativePss,
+        javaUsed = rt.totalMemory() - rt.freeMemory(),
+        javaMax = rt.maxMemory(),
+        sysAvail = sys.availMem,
+        sysTotal = sys.totalMem,
+        lowMemory = sys.lowMemory,
+    )
+}
+
+/** 内存探针面板：显示期间每 2s 采样一次（离开组合自动停止）。 */
 @Composable
-private fun SettingRow(label: String, value: String, mono: Boolean = false) {
+private fun MemoryProbePanel() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var sample by remember { androidx.compose.runtime.mutableStateOf<MemSample?>(null) }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        while (true) {
+            sample = sampleMemory(context)
+            kotlinx.coroutines.delay(2000)
+        }
+    }
+    val s = sample ?: return
+    val mono = MaterialTheme.typography.bodyMedium.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
     Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+        HorizontalDivider(Modifier.padding(bottom = 8.dp))
+        MemRow("应用 PSS 总量", "%.1f MB".format(s.pssTotal), mono)
+        MemRow("├ Java 堆", "%.1f MB".format(s.pssJava), mono)
+        MemRow("├ 原生堆", "%.1f MB".format(s.pssNative), mono)
+        MemRow("└ 其他（代码/图形…）", "%.1f MB".format(s.pssOther), mono)
+        MemRow("运行时堆 已用/上限", "%.0f / %.0f MB".format(s.javaUsedMb, s.javaMaxMb), mono)
+        MemRow("系统 可用/总量", "%.2f / %.2f GB".format(s.sysAvailMb / 1024f, s.sysTotalMb / 1024f), mono)
+        if (s.lowMemory) {
+            Text(
+                "⚠ 系统低内存",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun MemRow(label: String, value: String, style: androidx.compose.ui.text.TextStyle) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, style = style)
+    }
+}
+
+@Composable
+private fun SettingRow(label: String, value: String, mono: Boolean = false) {    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
         Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(
             value,
