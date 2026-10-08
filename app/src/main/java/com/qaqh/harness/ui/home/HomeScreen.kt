@@ -68,6 +68,7 @@ fun HomeScreen(
     val activity by ConnectionService.activity.collectAsState()
     val pending by ConnectionService.pendingApprovals.collectAsState()
     val sessions by ConnectionService.sessions.collectAsState()
+    val sessionInfo by ConnectionService.sessionInfo.collectAsState()
     val workspaces by ConnectionService.workspaces.collectAsState()
     val refreshing by ConnectionService.refreshing.collectAsState()
     val scope = rememberCoroutineScope()
@@ -100,6 +101,7 @@ fun HomeScreen(
                 state = state,
                 activity = activity,
                 pending = pending,
+                currentSessionId = sessionInfo?.sessionId,
                 sections = sections,
                 onOpenSession = onOpenSession,
                 modifier = Modifier.fillMaxSize(),
@@ -117,12 +119,17 @@ fun HomeScreen(
     }
 }
 
-/** 活动视图 → 状态点颜色（等待态用 tertiary 提示"需要你"，出错/中断 error，空闲 outline）。 */
+/** 活动视图 → 状态点颜色（等待态用 tertiary 提示"需要你"，出错/中断 error，未加载/取消退到灰）。 */
 @Composable
 private fun activityColor(view: ActivityView): Color = when (view) {
     ActivityView.WORKING -> MaterialTheme.colorScheme.primary
     ActivityView.IDLE -> MaterialTheme.colorScheme.outline
-    ActivityView.INTERRUPTED -> MaterialTheme.colorScheme.error
+    ActivityView.INTERRUPTED,
+    ActivityView.ERROR,
+    -> MaterialTheme.colorScheme.error
+    ActivityView.CANCELED,
+    ActivityView.NOT_RUNNING,
+    -> MaterialTheme.colorScheme.outlineVariant
     ActivityView.WAITING_PERMISSION,
     ActivityView.WAITING_ASK,
     ActivityView.WAITING_PLAN,
@@ -138,6 +145,8 @@ fun HomeList(
     state: RingingConnection.State,
     activity: String?,
     pending: List<PendingApproval>,
+    /** SSE live 流与 pending 都只反映当前挂接会话——只有这张卡能用实时源覆盖轮询。 */
+    currentSessionId: String?,
     sections: List<SessionSection>,
     onOpenSession: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -163,7 +172,14 @@ fun HomeList(
                 SectionHeader(section)
             }
             items(section.sessions, key = { it.sessionId }) { entry ->
-                SessionCard(activity, pending, entry, Modifier.fillMaxWidth()) { onOpenSession(entry.sessionId) }
+                val isCurrent = entry.sessionId == currentSessionId
+                SessionCard(
+                    liveActivity = if (isCurrent) activity else null,
+                    pending = if (isCurrent) pending else emptyList(),
+                    session = entry,
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = { onOpenSession(entry.sessionId) },
+                )
             }
         }
     }
@@ -249,17 +265,18 @@ private fun EmptySessions(modifier: Modifier = Modifier) {
 
 /**
  * 会话卡片（M3 Expressive 大圆角 tonal 卡）：LLM 生成的工作区标题做主标题，
- * 相对时间进 meta 行；状态 = 活动视图（等待态由 pending 审批本地推导）+ 呼吸点。
+ * 相对时间进 meta 行；状态 = 活动视图（新 daemon 以 session.list status 8 态为准，
+ * 当前会话用 SSE live/pending 实时覆盖；旧 daemon 本地推导）+ 呼吸点。
  */
 @Composable
 private fun SessionCard(
-    activity: String?,
+    liveActivity: String?,
     pending: List<PendingApproval>,
     session: com.qaqh.harness.data.ringing.model.SessionListEntry,
     modifier: Modifier = Modifier,
     onClick: () -> Unit = {},
 ) {
-    val view = activityViewOf(activity, pending)
+    val view = activityViewOf(session, liveActivity, pending)
     // 需要用户介入（等待授权/回答/评审）与执行中一样用呼吸点——都是"有事发生"
     val attention = view == ActivityView.WORKING ||
         view == ActivityView.WAITING_PERMISSION ||

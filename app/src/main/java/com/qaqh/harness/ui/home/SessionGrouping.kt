@@ -8,29 +8,84 @@ import java.time.Instant
 import java.time.ZoneId
 
 /**
- * 首页/聊天头共用的会话活动视图。后端 control 投影的 activity 只有
- * idle|running|interrupted 三态（session_fact_v2 types.rs），交互挂起不改 activity、
- * 无 error 变体——`waiting_*` 由前端本地推导（对齐桌面 projection.ts:398：
- * pending interactions > 0 时覆盖为等待态）。error 属后端 gap（投影无 Failed 臂），
- * 本视图暂不含。
+ * 首页/聊天头共用的会话活动视图。两代事实源合成（后端 G2 v2 契约，
+ * feat/session-run-status-g2：session.list `running:bool` → `status` 8 态词表）：
+ * - `status`（fact 投影：挂起 interaction > control activity > 最近回合终态）
+ *   是跨会话的权威来源，新鲜度 = 15s 轮询；canceled/error 是驻留终态，
+ *   not_running 显式存在且**不得**渲染成空闲；
+ * - 当前挂接会话另有 SSE live activity（idle|running|interrupted 三态）与本地
+ *   pending 审批（control 投影挂起交互不改 activity）作实时覆盖。
+ * 旧 daemon 无 status 键 → 退 entry.running + live 本地推导。
  */
 enum class ActivityView(val label: String) {
     WORKING("工作中"),
     IDLE("空闲"),
     INTERRUPTED("已中断"),
+    CANCELED("已取消"),
+    ERROR("出错"),
+    NOT_RUNNING("未加载"),
     WAITING_PERMISSION("等待授权"),
     WAITING_ASK("等待回答"),
     WAITING_PLAN("等待评审"),
 }
 
-/** activity（投影三态；"working"/"starting" 为 domain 词表的防御性归并）+ 待审批 → 活动视图。 */
-fun activityViewOf(activity: String?, pending: List<PendingApproval>): ActivityView = when {
+/** session.list status 8 态词表 → 视图；缺键（旧 daemon）或未知词返回 null（走本地推导退路）。 */
+fun runStatusToView(status: String?): ActivityView? = when (status) {
+    "not_running" -> ActivityView.NOT_RUNNING
+    "idle" -> ActivityView.IDLE
+    "working" -> ActivityView.WORKING
+    "waiting_permission" -> ActivityView.WAITING_PERMISSION
+    "waiting_ask" -> ActivityView.WAITING_ASK
+    "waiting_plan" -> ActivityView.WAITING_PLAN
+    "canceled" -> ActivityView.CANCELED
+    "error" -> ActivityView.ERROR
+    else -> null
+}
+
+private fun pendingViewOf(pending: List<PendingApproval>): ActivityView? = when {
     pending.any { it.kind == InteractionKinds.PERMISSION } -> ActivityView.WAITING_PERMISSION
     pending.any { it.kind == InteractionKinds.ASK } -> ActivityView.WAITING_ASK
     pending.any { it.kind == InteractionKinds.PLAN } -> ActivityView.WAITING_PLAN
-    activity == "running" || activity == "working" || activity == "starting" -> ActivityView.WORKING
-    activity == "interrupted" -> ActivityView.INTERRUPTED
-    else -> ActivityView.IDLE
+    else -> null
+}
+
+/** "running"/"working"/"starting" 为 domain 词表的防御性归并。 */
+private fun isWorkingLive(activity: String?): Boolean =
+    activity == "running" || activity == "working" || activity == "starting"
+
+/**
+ * entry（可空）+ **仅当前挂接会话**的 liveActivity/pending → 活动视图；
+ * 非当前会话调用方须传 null/空列表（修"全局 activity 套所有卡片"的老 bug）。
+ * 合成规则：
+ * - 本地 pending 覆盖 waiting_*（实时事实盖轮询滞后，permission>ask>plan）；
+ * - status 词表命中为准；实时 live 只补轮询空窗：working 把 idle/not_running/
+ *   canceled/error 驻留态升为工作中（新回合开始即解除驻留），interrupted 覆盖
+ *   除 not_running 外的非等待态（未加载 ≠ 中断）；
+ * - 无 status（旧 daemon / 未知词）→ entry.running + live 本地推导。
+ */
+fun activityViewOf(
+    entry: SessionListEntry?,
+    liveActivity: String?,
+    pending: List<PendingApproval>,
+): ActivityView {
+    pendingViewOf(pending)?.let { return it }
+    val statusView = runStatusToView(entry?.status)
+    if (statusView != null) {
+        val waiting = statusView == ActivityView.WAITING_PERMISSION ||
+            statusView == ActivityView.WAITING_ASK ||
+            statusView == ActivityView.WAITING_PLAN
+        if (!waiting && isWorkingLive(liveActivity)) return ActivityView.WORKING
+        if (!waiting && statusView != ActivityView.NOT_RUNNING && liveActivity == "interrupted") {
+            return ActivityView.INTERRUPTED
+        }
+        return statusView
+    }
+    return when {
+        // 退路：status 缺键走归一值，未知词额外看原始 running（两代字段并存的过渡形状）
+        entry?.isWorking == true || entry?.running == true || isWorkingLive(liveActivity) -> ActivityView.WORKING
+        liveActivity == "interrupted" -> ActivityView.INTERRUPTED
+        else -> ActivityView.IDLE
+    }
 }
 
 /** 首页分区：一个工作区（或未分组）下的会话集合，updated_at 降序。 */

@@ -74,6 +74,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.mikepenz.markdown.compose.components.markdownComponents
+import com.mikepenz.markdown.compose.elements.highlightedCodeBlock
+import com.mikepenz.markdown.compose.elements.highlightedCodeFence
+import com.mikepenz.markdown.m3.Markdown
+import com.mikepenz.markdown.m3.elements.MarkdownCheckBox
+import com.mikepenz.markdown.m3.markdownTypography
 import com.qaqh.harness.connection.ConnectionService
 import com.qaqh.harness.connection.PendingApproval
 import com.qaqh.harness.data.ringing.RingingConnection
@@ -247,8 +253,8 @@ fun SessionScreen(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                // 等待态由待审批本地推导（后端 control 投影 activity 只有三态）
-                val view = activityViewOf(activity, approvals)
+                // 本屏就是当前挂接会话：status 为准，live activity/pending 实时覆盖
+                val view = activityViewOf(entry, activity, approvals)
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     entry?.model?.let { model ->
                         Text(
@@ -269,7 +275,12 @@ fun SessionScreen(
                             ActivityView.WAITING_ASK,
                             ActivityView.WAITING_PLAN,
                             -> MaterialTheme.colorScheme.tertiary
-                            ActivityView.INTERRUPTED -> MaterialTheme.colorScheme.error
+                            ActivityView.INTERRUPTED,
+                            ActivityView.ERROR,
+                            -> MaterialTheme.colorScheme.error
+                            ActivityView.CANCELED,
+                            ActivityView.NOT_RUNNING,
+                            -> MaterialTheme.colorScheme.outlineVariant
                             ActivityView.IDLE -> MaterialTheme.colorScheme.onSurfaceVariant
                         },
                     )
@@ -693,9 +704,9 @@ private fun BlockItem(block: TimelineBlock) {
                 // 定稿：Markdown 渲染（参数不变时 Compose 跳过重组合，解析只在块定稿时发生一次）
                 // 标题映射降到 title 级（库默认 h1=displayLarge，聊天流里一个标题占半屏）；
                 // 正文统一 bodyMedium，与流式纯文本一致，避免 sealed 瞬间字号跳变
-                com.mikepenz.markdown.m3.Markdown(
+                Markdown(
                     block.text,
-                    typography = com.mikepenz.markdown.m3.markdownTypography(
+                    typography = markdownTypography(
                         h1 = MaterialTheme.typography.titleLarge,
                         h2 = MaterialTheme.typography.titleLarge,
                         h3 = MaterialTheme.typography.titleMedium,
@@ -708,6 +719,15 @@ private fun BlockItem(block: TimelineBlock) {
                         bullet = MaterialTheme.typography.bodyMedium,
                         list = MaterialTheme.typography.bodyMedium,
                         table = MaterialTheme.typography.bodyMedium,
+                        // 库默认 FontFamily.Monospace（系统等宽），与 AppMono（Cascadia）不一致
+                        code = MaterialTheme.typography.bodyMedium.copy(fontFamily = AppMono),
+                        inlineCode = MaterialTheme.typography.bodyMedium.copy(fontFamily = AppMono),
+                    ),
+                    // components 一旦传入即覆盖 m3 默认（含其 checkbox），故 checkbox 需一并补齐
+                    components = markdownComponents(
+                        codeFence = highlightedCodeFence,
+                        codeBlock = highlightedCodeBlock,
+                        checkbox = { MarkdownCheckBox(it.content, it.node, it.typography.text) },
                     ),
                 )
             } else {
