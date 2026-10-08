@@ -15,6 +15,7 @@ import com.qaqh.harness.MainActivity
 import com.qaqh.harness.R
 import com.qaqh.harness.data.pairing.CredentialStore
 import com.qaqh.harness.data.pairing.pinnedHttpClient
+import com.qaqh.harness.data.ringing.RingingApi
 import com.qaqh.harness.data.ringing.RingingConnection
 import com.qaqh.harness.data.ringing.model.TodoState
 import com.qaqh.harness.data.ringing.model.ApprovalChallenge
@@ -38,6 +39,17 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.decodeFromJsonElement
 
+/**
+ * 服务作用域的最后一道闸：任何逃逸出各循环 try/catch 的异常都在这里落地成日志。
+ * 没有它，子协程（SupervisorJob 下失败不冒泡给父）的异常会走默认
+ * [kotlinx.coroutines.CoroutineExceptionHandler] → 线程 uncaught handler → 进程被杀，
+ * 表现为"放后台再进来就闪退"（真机 dropbox 里连排的同栈崩溃，见 SseSocketDeathTest）。
+ */
+internal val serviceExceptionGuard =
+    kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
+        android.util.Log.e("ConnectionService", "escaped service coroutine — kept alive", e)
+    }
+
 /** 当前待审批（v2 interaction_requested, kind=permission）投影。 */
 data class PendingApproval(
     val interactionId: String,
@@ -58,7 +70,7 @@ data class PendingApproval(
  */
 class ConnectionService : Service() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + serviceExceptionGuard)
     private var connection: RingingConnection? = null
     private val countdownJobs = HashMap<String, kotlinx.coroutines.Job>()
 
@@ -200,8 +212,15 @@ class ConnectionService : Service() {
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
-            } catch (e: com.qaqh.harness.data.ringing.RingingApi.ApiException) {
+            } catch (e: RingingApi.ApiException) {
                 android.util.Log.w(TAG, "todo tracker SSE ${e.httpStatus} ${e.code}")
+            } catch (e: Exception) {
+                // 断流（切后台被掐网 / daemon 重启 / 代理回收）给上来的多是裸
+                // IOException/SocketException：只 catch ApiException 会让它逃出这个
+                // launch，SupervisorJob 兜不住 → 线程 uncaught → 进程被杀（真机
+                // dropbox 里成串的 FATAL EXCEPTION: DefaultDispatcher-worker-N）。
+                // 这里必须按普通断流处理，退避后带游标重订阅。
+                android.util.Log.w(TAG, "todo tracker SSE dropped: ${e.javaClass.simpleName} ${e.message}")
             }
             delay(backoffMs)
             backoffMs = minOf(backoffMs * 2, 30_000L)

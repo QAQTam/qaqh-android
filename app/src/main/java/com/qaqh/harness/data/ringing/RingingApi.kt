@@ -16,10 +16,13 @@ import com.qaqh.harness.data.ringing.model.TimelineEntryEnvelope
 import com.qaqh.harness.data.ringing.model.TimelineEntryFrame
 import com.qaqh.harness.data.ringing.model.TimelineResponse
 import com.qaqh.harness.data.ringing.model.DriverClaimResponse
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
-import kotlinx.coroutines.channels.trySendBlocking
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -31,9 +34,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import okhttp3.sse.EventSource
-import okhttp3.sse.EventSourceListener
-import okhttp3.sse.EventSources
 
 /**
  * Ringing v2 HTTP 面：open / renew / bootstrap / SSE events / commands / approvals。
@@ -179,49 +179,96 @@ class RingingApi(
     /** GET /sessions/{session_id}/timeline/events — 聊天实时增量（event: timeline.entry / ringing.stream_terminated）。
      *  [lastEventId] 传 `{epoch}:timeline:{seq}`（Last-Event-ID）：服务端只回放该 seq 之后的尾巴；
      *  不传则全量回放整个会话历史（900+ 帧/次，重连风暴时的卡顿根源）。 */
-    fun timelineEvents(clientSessionId: String, sessionId: String, lastEventId: String? = null): Flow<TimelineSseEvent> = callbackFlow {
+    fun timelineEvents(clientSessionId: String, sessionId: String, lastEventId: String? = null): Flow<TimelineSseEvent> {
         val url = (baseUrl + RingingProtocol.BASE_PATH + "/sessions/$sessionId/timeline/events").toHttpUrl()
-        val request = Request.Builder().url(url)
-            .header("Authorization", "Bearer $token")
-            .header("X-QAQH-Client-Session-Id", clientSessionId)
-            .header("Accept", "text/event-stream")
-            .apply { if (!lastEventId.isNullOrBlank()) header("Last-Event-ID", lastEventId) }
-            .build()
-        lateinit var source: EventSource
-        source = EventSources.createFactory(sseHttp).newEventSource(request, object : EventSourceListener() {
-            override fun onOpen(eventSource: EventSource, response: Response) {
-                if (!response.isSuccessful) {
-                    val body = runCatching { response.body?.string() }.getOrNull().orEmpty()
-                    close(throwApiException(response, body))
-                }
+        return sseFlow(
+            Request.Builder().url(url)
+                .header("Authorization", "Bearer $token")
+                .header("X-QAQH-Client-Session-Id", clientSessionId)
+                .header("Accept", "text/event-stream")
+                .apply { if (!lastEventId.isNullOrBlank()) header("Last-Event-ID", lastEventId) }
+                .build(),
+        ) { _, type, data ->
+            when (type) {
+                EVENT_STREAM_TERMINATED -> TimelineSseEvent.Terminated
+                else -> runCatching {
+                    TimelineSseEvent.Entry(json.decodeFromString<TimelineEntryEnvelope>(data).entry)
+                }.onFailure {
+                    // 静默吞掉解码失败会让上层表现为"零帧"且无线索，必须留痕
+                    android.util.Log.w("RingingApi", "timeline frame decode failed: $it; data=${data.take(300)}")
+                }.getOrNull()
             }
-
-            override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
-                when (type) {
-                    EVENT_STREAM_TERMINATED -> trySendBlocking(TimelineSseEvent.Terminated)
-                    else -> runCatching {
-                        TimelineSseEvent.Entry(json.decodeFromString<TimelineEntryEnvelope>(data).entry)
-                    }.onSuccess { trySendBlocking(it) }
-                        .onFailure {
-                            // 静默吞掉解码失败会让上层表现为"零帧"且无线索，必须留痕
-                            android.util.Log.w("RingingApi", "timeline frame decode failed: $it; data=${data.take(300)}")
-                        }
-                }
-            }
-
-            override fun onClosed(eventSource: EventSource) { close() }
-
-            override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                close(t ?: ApiException(response?.code ?: 0, null, "timeline SSE failure"))
-            }
-        })
-        awaitClose { source.cancel() }
+        }
     }
 
     sealed interface TimelineSseEvent {
         data class Entry(val frame: TimelineEntryFrame) : TimelineSseEvent
         data object Terminated : TimelineSseEvent
     }
+
+    /**
+     * SSE 传输核心：自己逐行读 chunked body，不借 okhttp-sse 的 EventSource。
+     *
+     * 换掉的两处坑：
+     * 1) 旧实现的 onFailure 调 `close(cause)`——消费端已取消（退后台时 stop() 就是这样）
+     *    时它会把 cause 原样重抛，异常从 okhttp-sse 的回调里冒到 OkHttp 派发线程；
+     * 2) `trySendBlocking` 阻塞在派发线程上，下游一慢就反压整条连接。
+     * 现在读流跑在 callbackFlow 自己的子协程里：任何失败都归位成 collect 侧的异常，
+     * 由上层重连循环按普通断流处理（真机崩溃栈见 SseSocketDeathTest）。
+     *
+     * [decode] 返回 null = 该帧不可用（解码失败），跳过；调用方负责留痕。
+     */
+    private fun <T> sseFlow(request: Request, decode: (id: String?, type: String?, data: String) -> T?): Flow<T> =
+        callbackFlow {
+            val call = sseHttp.newCall(request)
+            launch(Dispatchers.IO) {
+                try {
+                    call.execute().use { resp ->
+                        if (!resp.isSuccessful) {
+                            throw throwApiException(resp, runCatching { resp.body?.string() }.getOrNull().orEmpty())
+                        }
+                        val src = resp.body?.source() ?: throw ApiException(resp.code, null, "empty SSE body")
+                        var id: String? = null
+                        var type: String? = null
+                        var data = StringBuilder()
+                        while (isActive) {
+                            val line = src.readUtf8Line() ?: break // null = 服务端正常收尾
+                            when {
+                                line.isEmpty() -> {
+                                    if (data.isNotEmpty()) {
+                                        decode(id, type, data.toString())?.let { send(it) }
+                                    }
+                                    id = null
+                                    type = null
+                                    data = StringBuilder()
+                                }
+                                // `:` 开头是 keepalive 注释，只保管道、不成帧
+                                line.startsWith(":") -> Unit
+                                else -> {
+                                    val sep = line.indexOf(':')
+                                    val field = if (sep < 0) line else line.substring(0, sep)
+                                    val value = if (sep < 0) "" else line.substring(sep + 1).removePrefix(" ")
+                                    when (field) {
+                                        "id" -> id = value
+                                        "event" -> type = value
+                                        "data" -> {
+                                            if (data.isNotEmpty()) data.append('\n')
+                                            data.append(value)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    close()
+                } catch (e: CancellationException) {
+                    close()
+                } catch (e: Exception) {
+                    if (isActive) close(e) else close()
+                }
+            }
+            awaitClose { call.cancel() }
+        }
 
     /** GET /content/{content_id} — 按 id 取内容原始字节（要求 lease 已 attach 该会话）。 */
     fun content(clientSessionId: String, contentId: String): String =
@@ -250,51 +297,28 @@ class RingingApi(
         clientSessionId: String,
         sessionId: String,
         sinceCursor: String?,
-    ): Flow<SseEvent> = callbackFlow {
+    ): Flow<SseEvent> {
         val url = (baseUrl + RingingProtocol.BASE_PATH + "/sessions/$sessionId/events").toHttpUrl()
             .newBuilder()
             .apply { if (sinceCursor != null) addQueryParameter("since_cursor", sinceCursor) }
             .build()
-        val request = Request.Builder()
-            .url(url)
-            .header("Authorization", "Bearer $token")
-            .header("X-QAQH-Client-Session-Id", clientSessionId)
-            .header("Accept", "text/event-stream")
-            .build()
-
-        // 必须用 sseHttp（readTimeout=0）：默认 client 10s 读超时会掐断空闲 SSE，
-        // 造成 ~11s 周期的重连风暴（每次重连都换 client_session_id）。
-        lateinit var source: EventSource
-        source = EventSources.createFactory(sseHttp).newEventSource(request, object : EventSourceListener() {
-            override fun onOpen(eventSource: EventSource, response: Response) {
-                if (!response.isSuccessful) {
-                    val body = runCatching { response.body?.string() }.getOrNull().orEmpty()
-                    close(throwApiException(response, body))
-                }
+        return sseFlow(
+            Request.Builder()
+                .url(url)
+                .header("Authorization", "Bearer $token")
+                .header("X-QAQH-Client-Session-Id", clientSessionId)
+                .header("Accept", "text/event-stream")
+                .build(),
+        ) { id, type, data ->
+            when (type) {
+                EVENT_RESET -> SseEvent.Reset(json.decodeFromString<ResetRequired>(data))
+                // daemon 在 broadcast Lagged（消费端跟不上被丢弃）时下发：必须据此
+                // 立即重订阅，静默丢弃会丢增量直到空闲看门狗兜底（最长 45s）
+                EVENT_STREAM_TERMINATED -> SseEvent.StreamTerminated
+                null, EVENT_RINGING -> SseEvent.Ringing(json.decodeFromString<EventEnvelope>(data), id)
+                else -> null
             }
-
-            override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
-                when (type) {
-                    EVENT_RESET -> trySendBlocking(SseEvent.Reset(json.decodeFromString<ResetRequired>(data)))
-                    // daemon 在 broadcast Lagged（消费端跟不上被丢弃）时下发：必须据此
-                    // 立即重订阅，静默丢弃会丢增量直到空闲看门狗兜底（最长 45s）
-                    EVENT_STREAM_TERMINATED -> trySendBlocking(SseEvent.StreamTerminated)
-                    null, EVENT_RINGING -> {
-                        val envelope = json.decodeFromString<EventEnvelope>(data)
-                        trySendBlocking(SseEvent.Ringing(envelope, id))
-                    }
-                }
-            }
-
-            override fun onClosed(eventSource: EventSource) {
-                close()
-            }
-
-            override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                close(t ?: ApiException(response?.code ?: 0, null, "SSE failure"))
-            }
-        })
-        awaitClose { source.cancel() }
+        }
     }
 
     sealed interface SseEvent {

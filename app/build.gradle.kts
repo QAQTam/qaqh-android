@@ -59,7 +59,6 @@ dependencies {
     implementation(libs.haze.glass) // 液态玻璃：hazeGlass（折射/高光 shader，@ExperimentalHazeApi）
     implementation(libs.haze.glass.material3) // GlassStyle.Material3 预设
     implementation(libs.okhttp)
-    implementation(libs.okhttp.sse)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.androidx.camera.camera2)

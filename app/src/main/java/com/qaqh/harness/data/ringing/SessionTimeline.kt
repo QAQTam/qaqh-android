@@ -134,6 +134,13 @@ class SessionTimeline(
                         } catch (e: RingingApi.ApiException) {
                             android.util.Log.w(TAG, "timeline SSE ApiException ${e.httpStatus} ${e.code}")
                             if (e.httpStatus != 401) throw e
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            // 裸 IOException/SocketException（切后台被掐网、代理回收连接）：
+                            // 与空闲断流同类，退避后带游标重订阅。冒到外层会把整条时间线
+                            // 判成 Error 且不再重连——后台回来后聊天屏就此冻结。
+                            android.util.Log.w(TAG, "timeline SSE dropped: ${e.javaClass.simpleName} ${e.message}")
                         }
                         // 断流后重订阅退避：首帧到达时归位 1s，持续连不上/连上即断时
                         // 指数增长（1s→30s），避免对抖动的 daemon 形成重连风暴
@@ -326,6 +333,11 @@ class SessionTimeline(
                 val merged = if (existing == null) incoming else incoming.copy(
                     rounds = existing.rounds.ifEmpty { incoming.rounds },
                     turnIndex = if (existing.turnIndex != 0L) existing.turnIndex else incoming.turnIndex,
+                    // SSE 重放不得把已定稿的回合复活成 running：sealed/state 以已落地的
+                    // 一方为准。定稿回合被复活后既不再折叠过程，又会作为"未密封回合"
+                    // 抢走后续帧的归属。
+                    sealed = existing.sealed,
+                    state = if (existing.sealed) existing.state else incoming.state,
                 )
                 _turns.value.filterNot { it.turnId == merged.turnId } + merged
             }
@@ -438,9 +450,30 @@ class SessionTimeline(
         val list = _turns.value
         val idx = frame.turnId?.let { id -> list.indexOfFirst { it.turnId == id } }
             ?.takeIf { it >= 0 }
-            ?: list.indexOfLast { !it.sealed }.takeIf { it >= 0 }
+            ?: newestUnsealedIndex(list)
             ?: return list
         return list.toMutableList().apply { set(idx, transform(get(idx))) }
+    }
+
+    /**
+     * 帧没带 turn_id（或指向还没落地的回合）时的兜底归属：最新的未密封回合。
+     * 不能按列表位置取——loadPage/refreshLatest 按 turn_index 重排、turn_opened 却直接
+     * 追加，列表序不等于时序；`indexOfLast { !sealed }` 于是会把新回合的帧塞进更老的
+     * 未密封回合（表现即"消息越长越容易跳到早期信息"）。turn_index 缺省为 0 的旧回合
+     * 用 created_seq 兜底，SSE 现场新开的回合（turn_index=MAX）自然胜出。
+     */
+    private fun newestUnsealedIndex(list: List<TimelineTurn>): Int? {
+        var best = -1
+        var bestKey = Long.MIN_VALUE
+        list.forEachIndexed { i, turn ->
+            if (turn.sealed) return@forEachIndexed
+            val key = if (turn.turnIndex != 0L) turn.turnIndex else turn.createdSeq
+            if (best < 0 || key >= bestKey) {
+                best = i
+                bestKey = key
+            }
+        }
+        return best.takeIf { it >= 0 }
     }
 }
 

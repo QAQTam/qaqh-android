@@ -64,7 +64,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -86,6 +85,7 @@ import com.qaqh.harness.ui.home.ActivityView
 import com.qaqh.harness.ui.home.activityViewOf
 import com.qaqh.harness.ui.theme.AppMono
 import com.qaqh.harness.ui.approvals.authenticateForApproval
+import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.launch
 
 // ---- 布局常量（与 HomeScreen 同一尺度体系）----
@@ -93,6 +93,9 @@ private val ScreenPadding = 16.dp
 private val BlockSpacing = 8.dp
 private val CardInnerPadding = 12.dp
 private val BubbleRadius = 12.dp
+
+/** 流式追底的尾沿采样间隔（每次滚动都要重排长 item，限频在此）。 */
+private const val FOLLOW_INTERVAL_MS = 80L
 
 @Composable
 fun SessionScreen(
@@ -153,27 +156,33 @@ fun SessionScreen(
             pinToBottom(listState)
         }
     }
-    // 新回合出现：自己发的消息（带用户文本）无条件回底；其余新内容跟随开关打开才追
-    LaunchedEffect(turns.size) {
-        if (!didInitialJump) return@LaunchedEffect
-        val lastTurn = turns.lastOrNull() ?: return@LaunchedEffect
-        if (lastTurn.userText != null) followBottom = true
+    // 新回合出现：自己发的消息（带用户文本）无条件回底；其余新内容跟随开关打开才追。
+    // 信号必须取"最新回合的身份"而非 turns.size——向上分页前插、发送后 refreshLatest
+    // 合并都会改变 size，按 size 触发会把用户刚翻上去看的历史一把拽回底部。
+    val newestTurnId = turns.lastOrNull()?.turnId
+    var seenTurnId by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(newestTurnId) {
+        val previous = seenTurnId
+        seenTurnId = newestTurnId
+        if (!didInitialJump || newestTurnId == null || previous == null || previous == newestTurnId) {
+            return@LaunchedEffect
+        }
+        if (turns.lastOrNull()?.userText != null) followBottom = true
         if (followBottom) pinToBottom(listState)
     }
     // 流式文本增长：跟随打开时把底边钉在视口底（无动画）。
-    // 80ms 节流：每条 delta 都滚动会强制长 item 反复 measure/layout（JankStats 实测
-    // 32-57ms 的 jank 与此相关）；80ms 内多次 delta 合并成一次滚动，残余偏移不足一行。
-    var lastFollowMs by remember { mutableLongStateOf(0L) }
-    val lastBlockSignature = turns.lastOrNull()?.rounds?.lastOrNull()?.blocks
-        ?.joinToString("/") { "${it.blockId}:${it.text?.length ?: 0}" }
-    LaunchedEffect(lastBlockSignature) {
-        if (didInitialJump && followBottom) {
-            val now = android.os.SystemClock.uptimeMillis()
-            if (now - lastFollowMs >= 80) {
-                lastFollowMs = now
-                pinToBottom(listState)
+    // 每条 delta 都滚会强制长 item 反复 measure/layout（JankStats 实测 32-57ms 的 jank
+    // 与此相关），所以要限频；但限频不能用"到点就丢掉这帧"的节流——视图会落后于
+    // 已增长的内容，下一次追底时整段跳过去，用户看到的就是"消息越长越容易跳到早期信息"。
+    // snapshotFlow.sample 是尾沿采样：每 80ms 最多滚一次，且永远落在最新状态上。
+    LaunchedEffect(listState) {
+        snapshotFlow {
+            val latest = turns.lastOrNull() ?: return@snapshotFlow null
+            latest.orderedBlocks().joinToString("/") { "${it.blockId}:${it.text?.length ?: 0}:${it.tool?.state ?: ""}" }
+        }.sample(FOLLOW_INTERVAL_MS)
+            .collect { sig ->
+                if (sig != null && didInitialJump && followBottom) pinToBottom(listState)
             }
-        }
     }
 
     // 历史分页：滚到顶部且上方还有内容时加载更早一页。loadOlder 内部有 Loading/EndReached
@@ -390,6 +399,14 @@ fun SessionScreen(
     }
 }
 
+/**
+ * 回合内块的时间序：round_num → block_order。渲染与流式追底共用这一份定义，
+ * 保证"看到的顺序"与"追底追的那个块"是同一个时序（后端每个 round 即
+ * 思考 → 正文 → 工具，任何按 kind 的二次分组都会把正文推到最后）。
+ */
+internal fun TimelineTurn.orderedBlocks(): List<TimelineBlock> =
+    rounds.sortedBy { it.roundNum }.flatMap { round -> round.blocks.sortedBy { it.blockOrder } }
+
 /** 流式期只渲染尾部：封顶单次重排版成本（sealed 后由 Markdown 渲染全文）。 */
 private fun streamTail(text: String, max: Int = 1_200): String =
     if (text.length <= max + 300) text else "…" + text.takeLast(max)
@@ -515,9 +532,13 @@ private fun DebugRecomposeCounter(tag: String) {
 private fun TurnItem(turn: TimelineTurn) {
     // debug 质量探针：未变化的 turn 不应重组（计数持续为 0 即"没有整棵树重渲染"的证据）
     if (com.qaqh.harness.BuildConfig.DEBUG) DebugRecomposeCounter("turn=${turn.turnId.take(8)}")
-    val blocks = remember(turn) { turn.rounds.flatMap { it.blocks } }
+    // 时序即渲染序：round_num → block_order。后端每个 round 就是"思考 → 正文 → 工具"，
+    // 之前按 kind 分成"过程/正文"两堆各自渲染，正文永远落在整堆过程卡之下
+    //（= 用户看到的"助手消息不按时序、直接堆到底部"）。
+    val blocks = remember(turn) { turn.orderedBlocks() }
     // 过程块（思考+工具）vs 内容块（正文/通知）——Qoder 式折叠的对象
-    val processBlocks = blocks.filter { it.kind == "reasoning" || (it.kind == "tool" && it.tool != null) }
+    val processBlocks = blocks.filter { it.isProcessBlock() }
+    var showProcessSheet by remember(turn.turnId) { mutableStateOf(false) }
 
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         turn.userText?.takeIf { it.isNotBlank() }?.let { userText ->
@@ -533,36 +554,35 @@ private fun TurnItem(turn: TimelineTurn) {
             }
         }
 
-        if (turn.sealed) {
-            // 回合完成：过程整体收成一行（Qoder assistantProcessFolding），流里只剩正文
-            if (processBlocks.isNotEmpty()) {
-                val show = remember { mutableStateOf(false) }
-                ProcessChip(
-                    label = "查看执行过程",
-                    subtitle = processSummary(processBlocks),
-                    stepCount = processBlocks.size,
-                    onClick = { show.value = true },
-                )
-                if (show.value) {
-                    ProcessSheet(processBlocks) { show.value = false }
-                }
-            }
-        } else {
-            // 回合进行中：过程全部按序展开（思考卡 3 行尾 + 工具卡带实时状态/预览），
-            // sealed 后上面的分支自动接管、整体收缩为聚合芯片
-            processBlocks.forEach { block ->
-                if (block.kind == "reasoning") ReasoningItem(block) else block.tool?.let { ToolCard(it) }
-            }
-        }
-
+        // 回合定稿后整段过程折成一行芯片，插在它原本最先出现的位置（时序锚点不移动）；
+        // 进行中则逐块按序展开。
+        val firstProcessId = processBlocks.firstOrNull()?.blockId
         blocks.forEach { block ->
-            if (block.kind == "text" || block.kind == "notice") BlockItem(block)
+            if (turn.sealed && block.isProcessBlock()) {
+                if (block.blockId == firstProcessId) {
+                    ProcessChip(
+                        label = "查看执行过程",
+                        subtitle = processSummary(processBlocks),
+                        stepCount = processBlocks.size,
+                        onClick = { showProcessSheet = true },
+                    )
+                }
+            } else {
+                BlockItem(block)
+            }
         }
         if (turn.state == "running") {
             Text("…", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(start = 4.dp))
         }
     }
+    if (showProcessSheet) {
+        ProcessSheet(processBlocks) { showProcessSheet = false }
+    }
 }
+
+/** 过程块 = 思考与工具卡（正文/通知之外的全部），回合定稿后整体折叠的对象。 */
+private fun TimelineBlock.isProcessBlock(): Boolean =
+    kind == "reasoning" || (kind == "tool" && tool != null)
 
 /** 过程聚合副标题：按家族分类计数（Qoder 分类摘要的简化版），如"编辑 2 · 运行 5 · 思考 1"。 */
 private fun processSummary(blocks: List<TimelineBlock>): String? {
