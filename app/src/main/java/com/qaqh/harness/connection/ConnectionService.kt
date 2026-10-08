@@ -72,6 +72,7 @@ class ConnectionService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + serviceExceptionGuard)
     private var connection: RingingConnection? = null
+    private var timelineStream: com.qaqh.harness.data.ringing.TimelineStream? = null
     private val countdownJobs = HashMap<String, kotlinx.coroutines.Job>()
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -95,7 +96,13 @@ class ConnectionService : Service() {
         )
         connection = conn
         Companion.connection = conn
+        // 会话 timeline 的唯一订阅者：聊天屏的 reducer 和下面这条待办通知都是它的消费方
+        val stream = com.qaqh.harness.data.ringing.TimelineStream(conn, scope)
+        timelineStream = stream
+        Companion.timelineStream = stream
+        stream.start()
         scope.launch { conn.events.collect { handleEvent(it) } } // handleEvent 为 suspend，逐事件串行处理
+        scope.launch { stream.todos.collect { notifyTodo(this@ConnectionService, it) } }
         scope.launch {
             var unauthorizedFailures = 0
             conn.state.collect { st ->
@@ -125,12 +132,14 @@ class ConnectionService : Service() {
             }
         }
         scope.launch { sessionDiscoveryLoop(conn) }
-        scope.launch { todoTrackerLoop(conn) }
         conn.start()
     }
 
     override fun onDestroy() {
         scope.cancel()
+        timelineStream?.stop()
+        timelineStream = null
+        Companion.timelineStream = null
         connection = null
         Companion.connection = null
         Companion.running = null
@@ -165,88 +174,6 @@ class ConnectionService : Service() {
             }
             delay(15_000)
         }
-    }
-
-    /**
-     * 待办全局跟踪器：常驻 timeline SSE（服务端 hub 是 broadcast，同租约多连接各自收帧，
-     * 与聊天屏的 SessionTimeline 互不影响）。每租约/换会话/daemon 重启（epoch 变）后首订
-     * 全量回放重建 todo 状态，其后带 `{epoch}:timeline:{seq}` 游标只补尾巴。
-     */
-    private suspend fun todoTrackerLoop(conn: RingingConnection) {
-        var lastSeq: Long? = null
-        var trackedEpoch: String? = null
-        var trackedSession: String? = null
-        var todoState: TodoState? = null
-        var backoffMs = 1_000L
-        while (scope.isActive) {
-            val sid = conn.leases.first()
-            val sessionId = conn.currentSessionId() ?: run { delay(1_000); continue }
-            val epoch = (conn.state.value as? RingingConnection.State.Connected)?.serverEpoch
-            if (sessionId != trackedSession) {
-                trackedSession = sessionId
-                todoState = null
-                lastSeq = null
-            }
-            val cursor = if (epoch != null && epoch == trackedEpoch && lastSeq != null) {
-                "$epoch:timeline:$lastSeq"
-            } else {
-                null // epoch 变了或首订：全量回放重建
-            }
-            trackedEpoch = epoch
-            var frames = 0
-            try {
-                conn.api.timelineEvents(sid, sessionId, cursor).collect { ev ->
-                    when (ev) {
-                        is com.qaqh.harness.data.ringing.RingingApi.TimelineSseEvent.Entry -> {
-                            frames++
-                            if (frames == 1) backoffMs = 1_000L // 流恢复，退避归位
-                            lastSeq = maxOf(lastSeq ?: 0L, ev.frame.timelineSeq)
-                            val next = ingestTodoFrame(conn, todoState, ev.frame)
-                            if (next !== todoState) {
-                                todoState = next
-                                notifyTodo(this@ConnectionService, next)
-                            }
-                        }
-                        com.qaqh.harness.data.ringing.RingingApi.TimelineSseEvent.Terminated -> Unit
-                    }
-                }
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (e: RingingApi.ApiException) {
-                android.util.Log.w(TAG, "todo tracker SSE ${e.httpStatus} ${e.code}")
-            } catch (e: Exception) {
-                // 断流（切后台被掐网 / daemon 重启 / 代理回收）给上来的多是裸
-                // IOException/SocketException：只 catch ApiException 会让它逃出这个
-                // launch，SupervisorJob 兜不住 → 线程 uncaught → 进程被杀（真机
-                // dropbox 里成串的 FATAL EXCEPTION: DefaultDispatcher-worker-N）。
-                // 这里必须按普通断流处理，退避后带游标重订阅。
-                android.util.Log.w(TAG, "todo tracker SSE dropped: ${e.javaClass.simpleName} ${e.message}")
-            }
-            delay(backoffMs)
-            backoffMs = minOf(backoffMs * 2, 30_000L)
-        }
-    }
-
-    /** 从 timeline 帧摄取 todo 工具块（block_opened 内嵌 tool / tool_updated 顶层 tool）。 */
-    private fun ingestTodoFrame(
-        conn: RingingConnection,
-        state: TodoState?,
-        frame: com.qaqh.harness.data.ringing.model.TimelineEntryFrame,
-    ): TodoState? {
-        val type = frame.type ?: return state
-        val data = frame.event as? JsonObject ?: return state
-        val toolElement = when (type) {
-            "block_opened" -> (data["block"] as? JsonObject)?.get("tool")
-            "tool_updated" -> data["tool"]
-            else -> null
-        } ?: return state
-        val tool = runCatching {
-            conn.api.json.decodeFromJsonElement(
-                com.qaqh.harness.data.ringing.model.TimelineTool.serializer(),
-                toolElement,
-            )
-        }.getOrNull() ?: return state
-        return TodoState.ingestTool(state, tool.name, tool.argsJson)
     }
 
     private suspend fun handleEvent(event: RingingConnection.SessionEvent) {        when (event) {
@@ -530,15 +457,21 @@ class ConnectionService : Service() {
         @Volatile
         private var deviceScope: String? = null
 
+        @Volatile
+        private var timelineStream: com.qaqh.harness.data.ringing.TimelineStream? = null
+
         /** 会话屏直接借用当前连接（timeline/发消息）；未连接返回 null。 */
         fun activeConnection(): RingingConnection? = connection
+
+        /** 会话屏的 timeline 消费方共用这一条流（不要再自己订一遍——见 TimelineStream）。 */
+        fun activeTimelineStream(): com.qaqh.harness.data.ringing.TimelineStream? = timelineStream
 
         private val _lastRespondError = MutableStateFlow<String?>(null)
         val lastRespondError: StateFlow<String?> = _lastRespondError.asStateFlow()
 
         /**
          * 待办实况通知（Android 16 Live Updates / ColorOS 16 流体云胶囊）。
-         * 由 [todoTrackerLoop] 全局驱动（不再依赖聊天屏打开）：
+         * 由 [TimelineStream.todos] 全局驱动（不再依赖聊天屏打开）：
          * - NotificationCompat + setRequestPromotedOngoing(true) 请求胶囊提升呈现
          *   （前提：manifest 声明 POST_PROMOTED_NOTIFICATIONS + 用户在系统设置允许，
          *   见 [promotedOngoingEnabled]；Google platform-samples live-updates 同款配方）

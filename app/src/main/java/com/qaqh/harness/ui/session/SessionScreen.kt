@@ -106,8 +106,10 @@ fun SessionScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val connection = ConnectionService.activeConnection()
+    // timeline SSE 由 ConnectionService 的 TimelineStream 独占，聊天屏只是它的一个消费方
+    val stream = ConnectionService.activeTimelineStream()
 
-    if (connection == null) {
+    if (connection == null || stream == null) {
         Column(modifier.fillMaxSize().padding(ScreenPadding)) {
             Text("未连接", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onBack, modifier = Modifier.padding(top = BlockSpacing)) { Text("返回") }
@@ -115,7 +117,7 @@ fun SessionScreen(
         return
     }
 
-    val timeline = remember(sessionId) { SessionTimeline(connection, sessionId, scope) }
+    val timeline = remember(connection, stream, sessionId) { SessionTimeline(connection, sessionId, scope, stream) }
     val turns by timeline.turns.collectAsState()
     val status by timeline.status.collectAsState()
     val todos by timeline.todos.collectAsState()

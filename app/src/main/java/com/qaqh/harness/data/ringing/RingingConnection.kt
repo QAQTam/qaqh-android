@@ -108,6 +108,14 @@ class RingingConnection(
      */
     private val _leaseExpired = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
 
+    /**
+     * 目标会话的现值（replay=1）。[setSessionId] 是异步的（要等锁、要掐旧主循环），
+     * 只靠轮询 `currentSessionId()` 的订阅方会拖到下一条流自然断掉才换会话——
+     * [TimelineStream] 用这个信号立刻改订阅。
+     */
+    private val _sessionSeed = MutableStateFlow(sessionId)
+    val sessionSeed: StateFlow<String?> = _sessionSeed
+
     /** 主循环内部信号：当前流的租约已失效/轮换，按情况本地重订阅或整体重连。 */
     private object LeaseExpired : Exception("lease expired")
 
@@ -132,6 +140,7 @@ class RingingConnection(
                 if (sessionId == newSessionId) return@launch
                 sessionId = newSessionId
                 cursor = null
+                _sessionSeed.value = newSessionId
             }
             mainLoop?.cancelAndJoin()
             mainLoop = scope.launch { runWithBackoff() }

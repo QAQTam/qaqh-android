@@ -9,27 +9,27 @@ import com.qaqh.harness.data.ringing.model.TimelineTurn
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
 /**
- * 单会话聊天时间线状态器：timeline 分页做底 + timeline/events SSE 做实时增量，
+ * 单会话聊天时间线状态器：timeline 分页做底 + [TimelineStream] 的共享实时帧做增量，
  * reducer 语义对齐 webui session/reducer.ts。
+ *
+ * 自己不碰 SSE——整条流的订阅由 [TimelineStream] 独占（待办通知是另一个消费方）。
  */
 class SessionTimeline(
     private val connection: RingingConnection,
     val sessionId: String,
     private val scope: CoroutineScope,
+    private val stream: TimelineStream,
 ) {
     private val _turns = MutableStateFlow<List<TimelineTurn>>(emptyList())
     val turns: StateFlow<List<TimelineTurn>> = _turns.asStateFlow()
@@ -37,9 +37,8 @@ class SessionTimeline(
     private val _status = MutableStateFlow<Status>(Status.Idle)
     val status: StateFlow<Status> = _status.asStateFlow()
 
-    /** 当前待办清单（来自 todo_write/todo_update 工具块的 args_json；null = 本会话无待办）。 */
-    private val _todos = MutableStateFlow<com.qaqh.harness.data.ringing.model.TodoState?>(null)
-    val todos: StateFlow<com.qaqh.harness.data.ringing.model.TodoState?> = _todos.asStateFlow()
+    /** 当前待办清单：与实况通知同源，由 [TimelineStream] 统一从工具块摄取。 */
+    val todos: StateFlow<com.qaqh.harness.data.ringing.model.TodoState?> = stream.todos
 
     sealed interface Status {
         data object Idle : Status
@@ -57,12 +56,12 @@ class SessionTimeline(
 
     /**
      * 已消费的最大 timeline_seq（REST 页用 snapshot.watermark、SSE 帧用逐帧 seq 推进）。
-     * 重订阅时作为 `Last-Event-ID: {epoch}:timeline:{seq}` 游标传给服务端——只补尾巴，
-     * 不再全量回放（对齐 webui qaqh-client timeline.rs 的行为）。
+     * 合并前它还用作 SSE 的 `Last-Event-ID` 游标；现在游标归 [TimelineStream] 管，
+     * 这里只用来把回放缓存里已被 REST 页覆盖的帧滤掉。
      */
     private var lastSeq: Long? = null
 
-    /** 首屏加载 + 订阅实时增量。 */
+    /** 首屏加载 + 接上共享实时流。 */
     fun start(onError: (String) -> Unit) {
         if (eventsJob != null) return
         eventsJob = scope.launch {
@@ -70,83 +69,18 @@ class SessionTimeline(
                 withContext(Dispatchers.IO) {
                     _status.value = Status.Loading
                     loadPage()
-                    // SSE 订阅循环：跟随租约（重连/续租失败轮换/切会话）自动重订阅。
-                    // 不能只在 Connected 状态变化时订阅——续租失败路径的 connectOnce
-                    // 不经过 Connecting，状态不变但租约已换，旧租约的 live 帧会被
-                    // 服务端逐帧静默丢弃（sse.rs should_deliver_timeline_live）。
-                    var resubDelayMs = 1_000L
-                    while (isActive) {
-                        val sid = connection.leases.first()
-                        // 游标 = 当前 epoch + 已消费水位：epoch 变了（daemon 重启）服务端会
-                        // 自动退回全量回放（reducer 幂等），正常重连只补尾巴
-                        val epoch = (connection.state.value as? RingingConnection.State.Connected)?.serverEpoch
-                        val cursor = if (epoch != null && lastSeq != null) "$epoch:timeline:$lastSeq" else null
-                        android.util.Log.i(
-                            TAG,
-                            "timeline SSE subscribe lease=${sid.take(8)} session=${sessionId.take(12)} " +
-                                "cursor=${if (cursor != null) "seq=$lastSeq" else "none(full replay)"}",
-                        )
-                        try {
-                            var frames = 0
-                            coroutineScope {
-                                // 空闲看门狗：服务端每 15s 发 keepalive 注释（OkHttp 监听器看不到），
-                                // 正常流式期间帧间隔远小于此。长时间零帧说明流已半开/黑洞
-                                // （网络切换、代理回收），带游标重订阅快速恢复。
-                                // 阈值对齐 Rust v2_stream.rs 的 45s 字节级探活。
-                                var lastFrameAt = System.nanoTime()
-                                val watchdog = launch {
-                                    while (true) {
-                                        delay(5_000)
-                                        if (System.nanoTime() - lastFrameAt > IDLE_TIMEOUT_MS * 1_000_000) {
-                                            throw StreamIdle
-                                        }
-                                    }
-                                }
-                                val leaseWaiter = launch {
-                                    connection.leases.drop(1).first()
-                                    throw LeaseRotated
-                                }
-                                try {
-                                    connection.api.timelineEvents(sid, sessionId, cursor).collect { ev ->
-                                        lastFrameAt = System.nanoTime()
-                                        frames++
-                                        if (frames == 1) resubDelayMs = 1_000L // 流恢复正常，退避归位
-                                        if (frames == 1 || frames % 100 == 0) {
-                                            android.util.Log.i(TAG, "timeline SSE frames=$frames")
-                                        }
-                                        when (ev) {
-                                            is RingingApi.TimelineSseEvent.Entry -> applyFrame(ev.frame)
-                                            RingingApi.TimelineSseEvent.Terminated ->
-                                                android.util.Log.i(TAG, "timeline SSE terminated")
-                                        }
-                                    }
-                                } finally {
-                                    leaseWaiter.cancel()
-                                    watchdog.cancel()
-                                }
-                            }
-                            android.util.Log.i(TAG, "timeline SSE flow completed after $frames frames")
-                        } catch (e: LeaseRotated) {
-                            // 拿新租约立即重订阅
-                            continue
-                        } catch (e: StreamIdle) {
-                            android.util.Log.w(TAG, "timeline SSE idle ${IDLE_TIMEOUT_MS}ms — resubscribe with cursor")
-                        } catch (e: RingingApi.ApiException) {
-                            android.util.Log.w(TAG, "timeline SSE ApiException ${e.httpStatus} ${e.code}")
-                            if (e.httpStatus != 401) throw e
-                        } catch (e: kotlinx.coroutines.CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            // 裸 IOException/SocketException（切后台被掐网、代理回收连接）：
-                            // 与空闲断流同类，退避后带游标重订阅。冒到外层会把整条时间线
-                            // 判成 Error 且不再重连——后台回来后聊天屏就此冻结。
-                            android.util.Log.w(TAG, "timeline SSE dropped: ${e.javaClass.simpleName} ${e.message}")
-                        }
-                        // 断流后重订阅退避：首帧到达时归位 1s，持续连不上/连上即断时
-                        // 指数增长（1s→30s），避免对抖动的 daemon 形成重连风暴
-                        delay(resubDelayMs)
-                        resubDelayMs = minOf(resubDelayMs * 2, RESUB_DELAY_MAX_MS)
-                    }
+                }
+                // 水位到回放缓存起点之间若已被挤掉，补一页再订阅——否则那段增量永久丢失
+                //（流式正文会缺一截，要到块定稿才自愈）
+                val oldestCached = stream.oldestBufferedSeq()
+                if (oldestCached != null && oldestCached > (lastSeq ?: 0L) + 1) {
+                    android.util.Log.i(TAG, "replay gap: watermark=$lastSeq oldest=$oldestCached — re-paging")
+                    withContext(Dispatchers.IO) { loadPage() }
+                }
+                // SharedFlow 保证"回放缓存 + 后续实时"原子且有序。水位之前的帧 REST 页里
+                // 已经有了，必须丢掉：text_delta 不幂等，重复施加会把文字重复一遍。
+                stream.frames.collect { frame ->
+                    if (frame.timelineSeq > (lastSeq ?: 0L)) applyFrame(frame)
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -157,17 +91,8 @@ class SessionTimeline(
         }
     }
 
-    private object LeaseRotated : Exception("lease rotated")
-    private object StreamIdle : Exception("stream idle")
-
     private companion object {
         const val TAG = "SessionTimeline"
-
-        /** 无帧判定为死流的阈值；服务端 15s keepalive 只保管道，帧级空闲超过它即重订阅。对齐 Rust 45s。 */
-        const val IDLE_TIMEOUT_MS = 45_000L
-
-        /** 重订阅退避上限（对齐 Rust v2_stream 1s→30s）。 */
-        const val RESUB_DELAY_MAX_MS = 30_000L
 
         /** 工具进度缓冲上限（对齐 TUI MAX_PROGRESS_LEN），超出截头保尾。 */
         const val MAX_PROGRESS_LEN = 8_192
@@ -242,7 +167,6 @@ class SessionTimeline(
             .distinctBy { it.turnId }
             .sortedBy { it.turnIndex }
         lastSeq = maxOf(lastSeq ?: 0L, resp.snapshot.watermark)
-        rebuildTodos()
         oldestIndex = _turns.value.firstOrNull()?.turnIndex
         if (!resp.hasMore) {
             endReached = true
@@ -279,22 +203,6 @@ class SessionTimeline(
             .distinctBy { it.turnId }
             .sortedBy { it.turnIndex }
         lastSeq = maxOf(lastSeq ?: 0L, resp.snapshot.watermark)
-        rebuildTodos()
-    }
-
-    /** 分页/刷新后按时间序重放 todo 工具块，重建待办清单（冷进会话也能拿到当前状态）。 */
-    private fun rebuildTodos() {
-        var state: com.qaqh.harness.data.ringing.model.TodoState? = null
-        _turns.value.sortedBy { it.turnIndex }.forEach { turn ->
-            turn.rounds.forEach { round ->
-                round.blocks.forEach { block ->
-                    val tool = block.tool ?: return@forEach
-                    state = com.qaqh.harness.data.ringing.model.TodoState
-                        .ingestTool(state, tool.name, tool.argsJson)
-                }
-            }
-        }
-        _todos.value = state
     }
 
     private suspend fun awaitLease(): String =
@@ -406,22 +314,14 @@ class SessionTimeline(
 
             else -> _turns.value
         }
-
-        // todo 工具块 → 待办清单（write 整表替换 / update 单条 delta；畸形忽略）
-        val tool = when (type) {
-            "block_opened" -> nestedBlock()?.get("tool")?.let { decodeTool(it) }
-            "tool_updated" -> data["tool"]?.let { decodeTool(it) }
-            else -> null
-        }
-        com.qaqh.harness.data.ringing.model.TodoState
-            .ingestTool(_todos.value, tool?.name, tool?.argsJson)
-            ?.let { _todos.value = it }
+        // 待办清单不在这里算：[TimelineStream] 是同一个帧的另一个消费方，
+        // 两处各算一遍正是合并前状态会互相矛盾的原因。
     }
 
     private fun decodeTool(element: kotlinx.serialization.json.JsonElement): TimelineTool? =
-        runCatching { connection.api.json.decodeFromJsonElement(TimelineTool.serializer(), element) }.getOrNull()
+        com.qaqh.harness.data.ringing.decodeTimelineTool(connection.api, element)
 
-    /** 定位 frame 所属 turn（优先 turn_id，缺失时落到最后一个未密封 turn），对其 round 的 blocks 施加变换。 */
+    /** 定位 frame 所属 turn（优先 turn_id，缺失时落到最新的未密封 turn），对其 round 的 blocks 施加变换。 */
     private fun mutateRoundBlocks(
         frame: TimelineEntryFrame,
         transform: (List<TimelineBlock>) -> List<TimelineBlock>?,

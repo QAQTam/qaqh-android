@@ -2,6 +2,7 @@ package com.qaqh.harness
 
 import com.qaqh.harness.data.ringing.RingingConnection
 import com.qaqh.harness.data.ringing.SessionTimeline
+import com.qaqh.harness.data.ringing.TimelineStream
 import com.qaqh.harness.data.ringing.model.TimelineEntryFrame
 import com.qaqh.harness.data.ringing.model.TimelineRound
 import com.qaqh.harness.data.ringing.model.TimelineTurn
@@ -32,7 +33,9 @@ class SessionTimelineOrderingTest {
             sessionId = null,
             scope = CoroutineScope(Dispatchers.Unconfined),
         )
-        return SessionTimeline(connection, "seed", CoroutineScope(Dispatchers.Unconfined))
+        val scope = CoroutineScope(Dispatchers.Unconfined)
+        // 测试直接灌帧走 reducer，不经流；stream 只满足构造与 todos 委托
+        return SessionTimeline(connection, "seed", scope, TimelineStream(connection, scope))
     }
 
     private fun frame(turnId: String?, roundNum: Int?, event: JsonObject): TimelineEntryFrame =
