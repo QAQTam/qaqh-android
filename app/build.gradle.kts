@@ -70,6 +70,7 @@ dependencies {
     implementation(libs.androidx.metrics.performance) // JankStats：流式渲染逐帧耗时采集（debug 门控）
     implementation(libs.markdown.renderer.core) // Markdown：sealed 文本块定稿渲染
     implementation(libs.markdown.renderer.m3)
+    implementation(libs.markdown.renderer.code) // Markdown 代码块语法高亮（dev.snipme:highlights，解析在 Default 线程）
     debugImplementation(libs.androidx.ui.tooling)
 
     testImplementation(libs.junit)

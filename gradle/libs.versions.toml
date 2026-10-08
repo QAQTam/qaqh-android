@@ -47,6 +47,7 @@ androidx-biometric = { group = "androidx.biometric", name = "biometric", version
 androidx-metrics-performance = { group = "androidx.metrics", name = "metrics-performance", version.ref = "jankStats" }
 markdown-renderer-core = { group = "com.mikepenz", name = "multiplatform-markdown-renderer", version.ref = "markdownRenderer" }
 markdown-renderer-m3 = { group = "com.mikepenz", name = "multiplatform-markdown-renderer-m3", version.ref = "markdownRenderer" }
+markdown-renderer-code = { group = "com.mikepenz", name = "multiplatform-markdown-renderer-code", version.ref = "markdownRenderer" }
 haze = { group = "dev.chrisbanes.haze", name = "haze", version.ref = "haze" }
 haze-blur = { group = "dev.chrisbanes.haze", name = "haze-blur", version.ref = "haze" }
 haze-blur-material3 = { group = "dev.chrisbanes.haze", name = "haze-blur-material3", version.ref = "haze" }
