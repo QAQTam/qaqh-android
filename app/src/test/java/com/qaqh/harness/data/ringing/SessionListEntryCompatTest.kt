@@ -1,7 +1,7 @@
 package com.qaqh.harness.data.ringing
 
-import com.qaqh.harness.data.ringing.model.Approvals
 import com.qaqh.harness.data.ringing.model.ApprovalDecisions
+import com.qaqh.harness.data.ringing.model.DeviceChallengesResponse
 import com.qaqh.harness.data.ringing.model.SessionListEntry
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -72,7 +72,7 @@ class SessionListEntryCompatTest {
         val body = """{"challenges":[{"challenge_id":"$id",""" +
             """"kind":"tool_permission","expires_in":299,""" +
             """"details":{"tool_name":"exec","action_summary":"rm -rf /tmp","paths":["/tmp"],"level":2}}]}"""
-        val approvals = json.decodeFromString(Approvals.serializer(), body)
+        val approvals = json.decodeFromString(DeviceChallengesResponse.serializer(), body)
         assertEquals(1, approvals.challenges.size)
         val challenge = approvals.challenges.single()
         assertEquals(id, challenge.challengeId)
@@ -80,20 +80,13 @@ class SessionListEntryCompatTest {
         assertEquals(299L, challenge.expiresInSeconds)
         assertEquals("exec", challenge.permissionDetails?.toolName)
         assertEquals(listOf("/tmp"), challenge.permissionDetails?.paths)
-        // admin 形状键在 device 响应中不存在
-        assertEquals(null, approvals.pendingPermission)
     }
 
     @Test
-    fun `admin approvals legacy shape ignores challenges key`() {
-        val approvals = json.decodeFromString(
-            Approvals.serializer(),
-            """{"pending_permission":{"tool_call_id":"call_1","tool_name":"exec"}}""",
-        )
-        assertEquals("call_1", approvals.pendingPermission?.toolCallId)
-        assertTrue(approvals.challenges.isEmpty())
+    fun `approval decision vocabulary is locked to daemon command_for`() {
         // decision 词表与后端 challenge.rs command_for 对齐（编译期常量，防手滑改名）
         assertEquals("approve", ApprovalDecisions.APPROVE)
+        assertEquals("reject", ApprovalDecisions.REJECT)
         assertEquals("trust", ApprovalDecisions.TRUST)
         assertEquals("submit", ApprovalDecisions.SUBMIT)
         assertEquals("dismiss", ApprovalDecisions.DISMISS)

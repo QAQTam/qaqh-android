@@ -82,7 +82,7 @@ import com.mikepenz.markdown.m3.elements.MarkdownCheckBox
 import com.mikepenz.markdown.m3.markdownTypography
 import com.qaqh.harness.connection.ConnectionService
 import com.qaqh.harness.connection.PendingApproval
-import com.qaqh.harness.data.ringing.RingingConnection
+import com.qaqh.harness.data.core.CoreConnection
 import com.qaqh.harness.data.ringing.SessionTimeline
 import com.qaqh.harness.data.ringing.model.TimelineBlock
 import com.qaqh.harness.data.ringing.model.TimelineTool
@@ -112,10 +112,8 @@ fun SessionScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val connection = ConnectionService.activeConnection()
-    // timeline SSE 由 ConnectionService 的 TimelineStream 独占，聊天屏只是它的一个消费方
-    val stream = ConnectionService.activeTimelineStream()
 
-    if (connection == null || stream == null) {
+    if (connection == null) {
         Column(modifier.fillMaxSize().padding(ScreenPadding)) {
             Text("未连接", style = MaterialTheme.typography.titleMedium)
             OutlinedButton(onClick = onBack, modifier = Modifier.padding(top = BlockSpacing)) { Text("返回") }
@@ -123,7 +121,7 @@ fun SessionScreen(
         return
     }
 
-    val timeline = remember(connection, stream, sessionId) { SessionTimeline(connection, sessionId, scope, stream) }
+    val timeline = remember(connection, sessionId) { SessionTimeline(connection, sessionId, scope) }
     val turns by timeline.turns.collectAsState()
     val status by timeline.status.collectAsState()
     val todos by timeline.todos.collectAsState()

@@ -47,7 +47,7 @@ import androidx.compose.ui.unit.dp
 import com.qaqh.harness.connection.ConnectionService
 import com.qaqh.harness.connection.PendingApproval
 import com.qaqh.harness.data.pairing.StoredCredentials
-import com.qaqh.harness.data.ringing.RingingConnection
+import com.qaqh.harness.data.core.CoreConnection
 import com.qaqh.harness.ui.nav.GlassNavBarContentPadding
 import kotlinx.coroutines.launch
 
@@ -108,7 +108,7 @@ fun HomeScreen(
             )
             ExtendedFloatingActionButton(
                 onClick = {
-                    if (!creating && state is RingingConnection.State.Connected) createSession()
+                    if (!creating && state is CoreConnection.State.Connected) createSession()
                 },
                 shape = RoundedCornerShape(20.dp),
                 modifier = Modifier
@@ -142,7 +142,7 @@ private fun activityColor(view: ActivityView): Color = when (view) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun HomeList(
-    state: RingingConnection.State,
+    state: CoreConnection.State,
     activity: String?,
     pending: List<PendingApproval>,
     /** SSE live 流与 pending 都只反映当前挂接会话——只有这张卡能用实时源覆盖轮询。 */
@@ -218,18 +218,18 @@ private fun SectionHeader(section: SessionSection) {
 
 /** 顶部：应用名大标题 + 连接状态点（endpoint 等细节移到设置屏）。 */
 @Composable
-private fun HomeHeader(state: RingingConnection.State, modifier: Modifier = Modifier) {
+private fun HomeHeader(state: CoreConnection.State, modifier: Modifier = Modifier) {
     val label = when (state) {
-        is RingingConnection.State.Connected -> "已连接电脑端"
-        is RingingConnection.State.Connecting -> "正在连接…"
-        is RingingConnection.State.Failed -> "连接失败（自动重试中）"
-        RingingConnection.State.Disconnected -> "未连接"
+        is CoreConnection.State.Connected -> "已连接电脑端"
+        is CoreConnection.State.Connecting -> "正在连接…"
+        is CoreConnection.State.Failed -> "连接失败（自动重试中）"
+        CoreConnection.State.Disconnected -> "未连接"
     }
     val color = when (state) {
-        is RingingConnection.State.Connected -> MaterialTheme.colorScheme.primary
-        is RingingConnection.State.Connecting -> MaterialTheme.colorScheme.tertiary
-        is RingingConnection.State.Failed -> MaterialTheme.colorScheme.error
-        RingingConnection.State.Disconnected -> MaterialTheme.colorScheme.outline
+        is CoreConnection.State.Connected -> MaterialTheme.colorScheme.primary
+        is CoreConnection.State.Connecting -> MaterialTheme.colorScheme.tertiary
+        is CoreConnection.State.Failed -> MaterialTheme.colorScheme.error
+        CoreConnection.State.Disconnected -> MaterialTheme.colorScheme.outline
     }
     Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text("QAQ Harness", style = MaterialTheme.typography.headlineLarge)

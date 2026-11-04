@@ -2,26 +2,7 @@ package com.qaqh.harness.data.ringing.model
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerialName
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
-
-/**
- * Timeline API（`GET /sessions/{session_id}/timeline`）wire 模型，
- * 字段对齐 qaqh-domain timeline.rs 与 webui/src/api/qaqh/Timeline*.ts。
- */
-
-@Serializable
-data class TimelineResponse(
-    val snapshot: TimelineSnapshot,
-    @SerialName("has_more") val hasMore: Boolean = false,
-    @SerialName("total_turns") val totalTurns: Int = 0,
-)
-
-@Serializable
-data class TimelineSnapshot(
-    val watermark: Long = 0,
-    val turns: List<TimelineTurn> = emptyList(),
-)
 
 @Serializable
 data class TimelineTurn(
@@ -94,39 +75,3 @@ data class ToolMetrics(
 @Serializable
 data class ToolFailure(val code: String? = null, val message: String? = null)
 
-// ---------- timeline/events SSE ----------
-
-/** `event: timeline.entry` 的完整 data：{schema,...,entry:{timeline_seq, turn_id, round_num?, event}}。 */
-@Serializable
-data class TimelineEntryEnvelope(
-    val schema: String = "",
-    @SerialName("session_id") val sessionId: String = "",
-    val entry: TimelineEntryFrame,
-)
-
-/** TimelineEntry：{timeline_seq, turn_id, round_num?, event}。 */
-@Serializable
-data class TimelineEntryFrame(
-    @SerialName("timeline_seq") val timelineSeq: Long,
-    @SerialName("turn_id") val turnId: String? = null,
-    @SerialName("round_num") val roundNum: Int? = null,
-    val event: JsonElement,
-) {
-    /** TimelineEvent 是 tag="type" 内嵌标记；取出 type 与整个 data。 */
-    val type: String?
-        get() = (event as? kotlinx.serialization.json.JsonObject)?.get("type")
-            ?.let { it as? kotlinx.serialization.json.JsonPrimitive }?.content
-
-    val data: JsonElement?
-        get() = event
-}
-
-// ---------- driver ----------
-
-@Serializable
-data class DriverClaimResponse(
-    val accepted: Boolean = false,
-    val holder: String? = null,
-    @SerialName("driver_epoch") val driverEpoch: Long = 0,
-    val reason: String? = null,
-)

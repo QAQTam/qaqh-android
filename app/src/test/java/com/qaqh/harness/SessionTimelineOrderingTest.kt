@@ -1,14 +1,18 @@
 package com.qaqh.harness
 
-import com.qaqh.harness.data.ringing.RingingConnection
+import com.qaqh.harness.data.core.CoreConnection
+import com.qaqh.harness.data.core.SessionEvent
+import com.qaqh.harness.data.core.SessionState
+import com.qaqh.harness.data.core.TurnView
+import com.qaqh.harness.data.core.ToolCallView
 import com.qaqh.harness.data.ringing.SessionTimeline
-import com.qaqh.harness.data.ringing.TimelineStream
-import com.qaqh.harness.data.ringing.model.TimelineEntryFrame
+import com.qaqh.harness.data.ringing.model.TimelineBlock
 import com.qaqh.harness.data.ringing.model.TimelineRound
 import com.qaqh.harness.data.ringing.model.TimelineTurn
 import com.qaqh.harness.ui.session.orderedBlocks
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -18,89 +22,132 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 时间线时序回归：助手正文必须按"思考 → 正文 → 工具"的真实发生顺序落位，
- * 且 SSE 重放不得把已定稿的回合复活（复活后它会继续抢走后续帧的归属）。
+ * 时间线时序回归(v3 reducer):正文按"输入 → 思考 → 正文 → 工具"的发生顺序落位;
+ * 事件重放不得把已定稿的回合复活;乱序到达的块也要正确归属。
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class SessionTimelineOrderingTest {
 
-    private var seq = 0L
-
-    private fun timeline(): SessionTimeline {
-        seq = 0
-        val connection = RingingConnection(
-            endpoint = "http://localhost:1",
-            token = "test",
-            sessionId = null,
-            scope = CoroutineScope(Dispatchers.Unconfined),
+    private fun timeline(): SessionTimeline =
+        SessionTimeline(
+            CoreConnection(
+                endpoint = "http://localhost:1",
+                token = "test",
+                tlsFingerprint = null,
+                scope = CoroutineScope(Dispatchers.Unconfined),
+            ),
+            "seed",
+            CoroutineScope(Dispatchers.Unconfined),
         )
-        val scope = CoroutineScope(Dispatchers.Unconfined)
-        // 测试直接灌帧走 reducer，不经流；stream 只满足构造与 todos 委托
-        return SessionTimeline(connection, "seed", scope, TimelineStream(connection, scope))
-    }
 
-    private fun frame(turnId: String?, roundNum: Int?, event: JsonObject): TimelineEntryFrame =
-        TimelineEntryFrame(timelineSeq = ++seq, turnId = turnId, roundNum = roundNum, event = event)
-
-    private fun opened(turnId: String, userText: String, turnIndex: Long = 0): JsonObject =
-        buildJsonObject {
-            put("type", "turn_opened")
-            put("turn_index", turnIndex)
-            put("user_text", userText)
-        }
-
-    private fun blockOpened(blockId: String, kind: String, order: Int): JsonObject = buildJsonObject {
-        put("type", "block_opened")
-        putJsonObject("block") {
+    private fun inputEntry(turnId: String, blockId: String, text: String): JsonObject = buildJsonObject {
+        put("kind", "input")
+        putJsonObject("data") {
             put("block_id", blockId)
-            put("block_order", order)
-            put("kind", kind)
-            put("state", "open")
+            put("turn_id", turnId)
+            put("purpose", "trigger_turn")
+            putJsonObject("content") {
+                put("kind", "inline")
+                putJsonObject("data") { put("text", text) }
+            }
         }
     }
 
-    private fun delta(blockId: String, text: String): JsonObject = buildJsonObject {
-        put("type", "text_delta")
-        put("block_id", blockId)
-        put("delta", text)
-    }
-
-    private fun sealed(type: String): JsonObject = buildJsonObject { put("type", type) }
+    private fun assistantEntry(turnId: String, blockId: String, kind: String, text: String): JsonObject =
+        buildJsonObject {
+            put("kind", "assistant_block")
+            putJsonObject("data") {
+                put("block_id", blockId)
+                put("turn_id", turnId)
+                put("block_kind", kind)
+                putJsonObject("content") {
+                    put("kind", "inline")
+                    putJsonObject("data") { put("text", text) }
+                }
+            }
+        }
 
     @Test
-    fun `replayed turn_opened keeps a sealed turn sealed`() {
+    fun `replayed turn_started keeps a sealed turn sealed`() {
         val t = timeline()
-        t.applyFrameForTest(frame("t1", 0, opened("t1", "第一问")))
-        t.applyFrameForTest(frame("t1", 0, blockOpened("b1", "text", 0)))
-        t.applyFrameForTest(frame("t1", 0, delta("b1", "答案")))
-        t.applyFrameForTest(frame("t1", 0, sealed("turn_sealed")))
-        assertTrue("前置：回合应已定稿", t.turnsForTest().single().sealed)
+        t.applyEventForTest(SessionEvent.TurnStarted("t1"))
+        t.applyEventForTest(SessionEvent.TimelineAppended(inputEntry("t1", "in1", "第一问")))
+        t.applyEventForTest(SessionEvent.MessageDelta("t1", "b1", "answer", "答案"))
+        t.applyEventForTest(
+            SessionEvent.TurnEnded(
+                "t1",
+                buildJsonObject {
+                    put("kind", "finished")
+                    putJsonObject("data") { put("terminal", "completed") }
+                },
+            ),
+        )
+        assertTrue("前置:回合应已定稿", t.turnsForTest().single().sealed)
 
-        // SSE 带游标重订阅会重放 turn_opened：不能把定稿回合改回 running
-        t.applyFrameForTest(frame("t1", 0, opened("t1", "第一问")))
+        // 流重订阅会重放事件:不能把定稿回合改回 running(v3 ensureTurn 幂等)
+        t.applyEventForTest(SessionEvent.TurnStarted("t1"))
         val turn = t.turnsForTest().single()
-        assertTrue("重放 turn_opened 把已定稿回合复活了", turn.sealed)
+        assertTrue("重放把已定稿回合复活了", turn.sealed)
         assertEquals("completed", turn.state)
-        assertEquals("答案", turn.rounds.single().blocks.single().text)
+        assertEquals("第一问", turn.userText)
+        assertEquals("答案", turn.rounds.single().blocks.single { it.blockId == "b1" }.text)
     }
 
     @Test
-    fun `frames without turn_id go to the newest unsealed turn, not the last list slot`() {
+    fun `message_delta for an unseen turn creates the turn (out-of-order arrival)`() {
         val t = timeline()
-        // 现场：SSE 顺序不等于 turn 顺序（重放/分页合并都会打乱列表位置）。
-        // 列表里最后一个未密封回合是"更早"的那个，帧不能按列表位置归属。
-        t.applyFrameForTest(frame("t9", 0, opened("t9", "最新一问", turnIndex = 9)))
-        t.applyFrameForTest(frame("t9", 0, blockOpened("b9", "text", 0)))
-        t.applyFrameForTest(frame("t5", 0, opened("t5", "更早一问", turnIndex = 5)))
-        t.applyFrameForTest(frame("t5", 0, blockOpened("b5", "text", 0)))
+        // 事件顺序不保证 turn_started 先到(重连窗口):MessageDelta 必须自建回合归属
+        t.applyEventForTest(SessionEvent.MessageDelta("t2", "b2", "answer", "先到的增量"))
+        val turn = t.turnsForTest().single()
+        assertEquals("t2", turn.turnId)
+        assertEquals("先到的增量", turn.rounds.single().blocks.single().text)
+    }
 
-        // 帧不带 turn_id（服务端某些路径只带 round_num）：必须落到最新的未密封回合，
-        // 否则 b9 在错误的回合里找不到，这条增量就凭空丢了
-        t.applyFrameForTest(frame(null, 0, delta("b9", "新内容")))
+    @Test
+    fun `message_delta replaces instead of appending (v3 replace semantics)`() {
+        val t = timeline()
+        t.applyEventForTest(SessionEvent.TurnStarted("t1"))
+        t.applyEventForTest(SessionEvent.MessageDelta("t1", "b1", "answer", "片段一"))
+        t.applyEventForTest(SessionEvent.MessageDelta("t1", "b1", "answer", "片段一片段二"))
+        assertEquals("片段一片段二", t.turnsForTest().single().rounds.single().blocks.single().text)
+    }
 
-        val newest = t.turnsForTest().first { it.turnId == "t9" }
-        val older = t.turnsForTest().first { it.turnId == "t5" }
-        assertEquals("新内容", newest.rounds.flattenToString())
-        assertEquals("", older.rounds.flattenToString())
+    @Test
+    fun `bootstrap rebuilds turns from state snapshot`() {
+        val t = timeline()
+        t.applyBootstrapForTest(
+            SessionState(
+                seq = 42,
+                turns = listOf(TurnView(turnId = "t1", phase = "running")),
+                timeline = listOf(
+                    inputEntry("t1", "in1", "快照问题"),
+                    buildJsonObject {
+                        put("kind", "tool_call")
+                        putJsonObject("data") {
+                            put("call_id", "call1")
+                            put("turn_id", "t1")
+                        }
+                    },
+                    assistantEntry("t1", "b1", "answer", "快照回答"),
+                ),
+                tools = listOf(
+                    ToolCallView(
+                        callId = "call1",
+                        turnId = "t1",
+                        toolName = "read_file",
+                        state = buildJsonObject { put("kind", "running") },
+                    ),
+                ),
+            ),
+        )
+        val turn = t.turnsForTest().single()
+        assertEquals("快照问题", turn.userText)
+        val blocks = turn.rounds.single().blocks
+        // blockOrder = 块序(0,1,...),不是快照 seq;顺序 = timeline 发生序(tool 先于回答)
+        assertEquals(listOf(0, 1), blocks.map { it.blockOrder })
+        assertEquals(listOf("tool", "text"), blocks.map { it.kind })
+        assertEquals("read_file", blocks.first { it.kind == "tool" }.tool?.name)
+        assertEquals("running", blocks.first { it.kind == "tool" }.tool?.state)
     }
 
     @Test
@@ -133,8 +180,5 @@ class SessionTimelineOrderingTest {
     }
 
     private fun block(id: String, kind: String, order: Int) =
-        com.qaqh.harness.data.ringing.model.TimelineBlock(blockId = id, blockOrder = order, kind = kind)
-
-    private fun List<TimelineRound>.flattenToString(): String =
-        flatMap { it.blocks }.joinToString("") { it.text ?: "" }
+        TimelineBlock(blockId = id, blockOrder = order, kind = kind)
 }

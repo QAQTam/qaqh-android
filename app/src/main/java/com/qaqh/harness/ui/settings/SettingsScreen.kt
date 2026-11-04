@@ -34,7 +34,7 @@ import androidx.compose.ui.unit.dp
 import com.qaqh.harness.BuildConfig
 import com.qaqh.harness.connection.ConnectionService
 import com.qaqh.harness.data.pairing.StoredCredentials
-import com.qaqh.harness.data.ringing.RingingConnection
+import com.qaqh.harness.data.core.CoreConnection
 import com.qaqh.harness.ui.nav.GlassNavBarContentPadding
 
 /**
@@ -60,16 +60,16 @@ fun SettingsScreen(
             modifier = Modifier.padding(start = 20.dp, top = 12.dp, bottom = 4.dp),
         )
         val stateLabel = when (state) {
-            is RingingConnection.State.Connected -> "已连接"
-            is RingingConnection.State.Connecting -> "正在连接…"
-            is RingingConnection.State.Failed -> "连接失败（自动重试中）"
-            RingingConnection.State.Disconnected -> "未连接"
+            is CoreConnection.State.Connected -> "已连接"
+            is CoreConnection.State.Connecting -> "正在连接…"
+            is CoreConnection.State.Failed -> "连接失败（自动重试中）"
+            CoreConnection.State.Disconnected -> "未连接"
         }
         val stateColor = when (state) {
-            is RingingConnection.State.Connected -> MaterialTheme.colorScheme.primary
-            is RingingConnection.State.Connecting -> MaterialTheme.colorScheme.tertiary
-            is RingingConnection.State.Failed -> MaterialTheme.colorScheme.error
-            RingingConnection.State.Disconnected -> MaterialTheme.colorScheme.outline
+            is CoreConnection.State.Connected -> MaterialTheme.colorScheme.primary
+            is CoreConnection.State.Connecting -> MaterialTheme.colorScheme.tertiary
+            is CoreConnection.State.Failed -> MaterialTheme.colorScheme.error
+            CoreConnection.State.Disconnected -> MaterialTheme.colorScheme.outline
         }
         SettingSection("连接") {
             Row(

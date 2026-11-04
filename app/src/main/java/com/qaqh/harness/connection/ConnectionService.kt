@@ -13,15 +13,19 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationCompat.ProgressStyle
 import com.qaqh.harness.MainActivity
 import com.qaqh.harness.R
+import com.qaqh.harness.data.core.CoreConnection
+import com.qaqh.harness.data.core.CoreFrame
+import com.qaqh.harness.data.core.SessionEvent as ContractSessionEvent
 import com.qaqh.harness.data.pairing.CredentialStore
-import com.qaqh.harness.data.pairing.pinnedHttpClient
-import com.qaqh.harness.data.ringing.RingingApi
-import com.qaqh.harness.data.ringing.RingingConnection
-import com.qaqh.harness.data.ringing.model.TodoState
 import com.qaqh.harness.data.ringing.model.ApprovalChallenge
 import com.qaqh.harness.data.ringing.model.ApprovalDecisions
 import com.qaqh.harness.data.ringing.model.InteractionKinds
+import com.qaqh.harness.data.ringing.model.InteractionResolved
+import com.qaqh.harness.data.ringing.model.SessionListEntry
+import com.qaqh.harness.data.ringing.model.TodoState
 import com.qaqh.harness.data.ringing.model.TodoStatus
+import com.qaqh.harness.data.ringing.model.CommandAck
+import com.qaqh.harness.data.ringing.model.WorkspaceEntry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -33,24 +37,23 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.decodeFromJsonElement
 
 /**
- * 服务作用域的最后一道闸：任何逃逸出各循环 try/catch 的异常都在这里落地成日志。
- * 没有它，子协程（SupervisorJob 下失败不冒泡给父）的异常会走默认
- * [kotlinx.coroutines.CoroutineExceptionHandler] → 线程 uncaught handler → 进程被杀，
- * 表现为"放后台再进来就闪退"（真机 dropbox 里连排的同栈崩溃，见 SseSocketDeathTest）。
+ * 服务作用域的最后一道闸:任何逃逸出各循环 try/catch 的异常都在这里落地成日志。
+ * 没有它,子协程(SupervisorJob 下失败不冒泡给父)的异常会走默认 handler → 进程被杀。
  */
 internal val serviceExceptionGuard =
     kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
         android.util.Log.e("ConnectionService", "escaped service coroutine — kept alive", e)
     }
 
-/** 当前待审批（v2 interaction_requested, kind=permission）投影。 */
+/** 当前待审批(kind=permission/ask/plan)投影。 */
 data class PendingApproval(
     val interactionId: String,
     /** permission | ask | plan */
@@ -61,18 +64,17 @@ data class PendingApproval(
 )
 
 /**
- * 常驻前台服务：持有 [RingingConnection]，把 SSE 事件投影为
- * 连接状态 / 会话活动 / 待审批三张全局 StateFlow，UI 层直接收集。
+ * 常驻前台服务:持有 [CoreConnection](Rust FFI 传输层),把会话流事件投影为
+ * 连接状态 / 会话活动 / 待办 / 待审批四张全局 StateFlow,UI 层直接收集。
  *
- * 会话发现采用建议稿 §6 的"单活跃流 + 轮询"模式：每 15s 拉 `session.list`，
- * 取 running 会话（否则最近更新的一个），session_id 变化时切换事件流。
- * 审批请求到达时发高优先级通知（点进 MainActivity）。
+ * 传输知识(租约续租、退避重连、SSE、TLS pin)全部在 Rust core;本服务只做
+ * 投影与通知。会话发现:每 15s 拉 session.list,取 working 会话(否则最近更新),
+ * session_id 变化时切流。device 身份的审批以 challenge 快照为准(SSE 只作刷新触发器)。
  */
 class ConnectionService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + serviceExceptionGuard)
-    private var connection: RingingConnection? = null
-    private var timelineStream: com.qaqh.harness.data.ringing.TimelineStream? = null
+    private var connection: CoreConnection? = null
     private val countdownJobs = HashMap<String, kotlinx.coroutines.Job>()
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -87,33 +89,28 @@ class ConnectionService : Service() {
         }
         Companion.deviceScope = creds?.scope
         Companion.running = this
-        val conn = RingingConnection(
+        val conn = CoreConnection(
             endpoint = creds.baseUrl,
             token = creds.token,
-            sessionId = null, // 先建租约，发现会话后再 setSessionId
+            tlsFingerprint = creds.tlsFingerprint, // https 自签:指纹 pin 在 Rust 侧注入
             scope = scope,
-            client = pinnedHttpClient(creds.tlsFingerprint), // https 自签：SPKI 指纹即信任锚
         )
         connection = conn
         Companion.connection = conn
-        // 会话 timeline 的唯一订阅者：聊天屏的 reducer 和下面这条待办通知都是它的消费方
-        val stream = com.qaqh.harness.data.ringing.TimelineStream(conn, scope)
-        timelineStream = stream
-        Companion.timelineStream = stream
-        stream.start()
-        scope.launch { conn.events.collect { handleEvent(it) } } // handleEvent 为 suspend，逐事件串行处理
-        scope.launch { stream.todos.collect { notifyTodo(this@ConnectionService, it) } }
+        scope.launch { conn.events.collect { handleEvent(it) } } // 逐事件串行处理
+        scope.launch { trackTodos(conn) }
+        scope.launch { _todos.collect { notifyTodo(this@ConnectionService, it) } }
         scope.launch {
             var unauthorizedFailures = 0
             conn.state.collect { st ->
-                if (st is RingingConnection.State.Failed && st.unauthorized) {
-                    // 连续 2 次真鉴权失败才认定吊销（单次 401 可能是竞态误报，wipe 不可逆）
+                if (st is CoreConnection.State.Failed && st.unauthorized) {
+                    // 连续 2 次真鉴权失败才认定吊销(单次 401 可能是竞态误报,wipe 不可逆)
                     unauthorizedFailures++
                     if (unauthorizedFailures < 2) {
-                        notifyStatus("认证异常，重试中…")
+                        notifyStatus("认证异常,重试中…")
                         return@collect
                     }
-                    android.util.Log.w("ConnectionService", "repeated 401 from daemon — device token invalid/revoked, unpairing")
+                    android.util.Log.w(TAG, "repeated 401 from daemon — device token invalid/revoked, unpairing")
                     CredentialStore(this@ConnectionService).clear()
                     _authRevoked.value = true
                     stopSelf()
@@ -123,10 +120,10 @@ class ConnectionService : Service() {
                 _connectionState.value = st
                 notifyStatus(
                     when (st) {
-                        is RingingConnection.State.Connected -> "已连接电脑端"
-                        is RingingConnection.State.Connecting -> "正在连接电脑端…"
-                        is RingingConnection.State.Failed -> "连接失败，将自动重试"
-                        RingingConnection.State.Disconnected -> "已断开"
+                        is CoreConnection.State.Connected -> "已连接电脑端"
+                        is CoreConnection.State.Connecting -> "正在连接电脑端…"
+                        is CoreConnection.State.Failed -> "连接失败,将自动重试"
+                        CoreConnection.State.Disconnected -> "已断开"
                     }
                 )
             }
@@ -137,28 +134,25 @@ class ConnectionService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
-        timelineStream?.stop()
-        timelineStream = null
-        Companion.timelineStream = null
+        connection?.client?.shutdown() // 主循环在 service scope 里,scope.cancel 已停编排
         connection = null
         Companion.connection = null
         Companion.running = null
-        _connectionState.value = RingingConnection.State.Disconnected
+        _connectionState.value = CoreConnection.State.Disconnected
         _activity.value = null
         _pendingApprovals.value = emptyList()
+        _todos.value = null
         super.onDestroy()
     }
 
-    /** 每 15s 发现一次活跃会话；session_id 变化时切换事件流。 */
-    private suspend fun sessionDiscoveryLoop(conn: RingingConnection) {
+    /** 每 15s 发现一次活跃会话;session_id 变化时切换事件流。 */
+    private suspend fun sessionDiscoveryLoop(conn: CoreConnection) {
         var currentSessionId: String? = null
         while (scope.isActive) {
-            // 先等连接就绪、立刻首拉，再进周期：冷启动列表 ~1-2s 可见
-            //（原实现先 delay(15s)，Home 的 refreshNow 又因未连接空手而归，列表空等 15s）
-            conn.state.first { it is RingingConnection.State.Connected }
+            // 先等连接就绪、立刻首拉,再进周期:冷启动列表 ~1-2s 可见
+            conn.state.first { it is CoreConnection.State.Connected }
             val sessions = refreshSessions(conn)
             if (sessions.isNotEmpty()) {
-                // runStatus 兼容新旧两代 daemon（backend-fix 后 running:bool → status 词表）
                 val target = sessions.firstOrNull { it.isWorking }
                     ?: sessions.maxByOrNull { it.updatedAt }
                 if (target != null && target.sessionId != currentSessionId) {
@@ -167,8 +161,7 @@ class ConnectionService : Service() {
                     conn.setSessionId(target.sessionId)
                 }
             }
-            // device 身份：待审批整体以 challenge 快照为准，每轮顺带刷新
-            //（challenge_id 按 (kind, session, source) 去重签发，跨刷新稳定）
+            // device 身份:待审批整体以 challenge 快照为准,每轮顺带刷新
             if (deviceScope != null) {
                 currentSessionId?.let { refreshChallenges(conn, it) }
             }
@@ -176,22 +169,45 @@ class ConnectionService : Service() {
         }
     }
 
-    private suspend fun handleEvent(event: RingingConnection.SessionEvent) {        when (event) {
-            is RingingConnection.SessionEvent.Activity -> {
+    /** 待办实况:当前会话流里的 todo 工具事件 → TodoState(全局通知驱动;切会话重置)。 */
+    private suspend fun trackTodos(conn: CoreConnection) {
+        conn.sessionSeed.collectLatest { seed ->
+            if (seed == null) return@collectLatest
+            _todos.value = null
+            conn.client.frames
+                .filter { it.sessionId == seed }
+                .collect { frame ->
+                    when (val e = frame.event) {
+                        is ContractSessionEvent.ToolDeclared ->
+                            _todos.value = TodoState.ingestTool(
+                                _todos.value,
+                                e.toolName,
+                                e.args?.toString(),
+                            ) ?: _todos.value
+                        else -> Unit
+                    }
+                }
+        }
+    }
+
+    private suspend fun handleEvent(event: CoreConnection.SessionEvent) {
+        when (event) {
+            is CoreConnection.SessionEvent.Activity -> {
                 _activity.value = event.state
                 notifyStatus(
                     when (event.state) {
                         "running" -> "会话正在工作…"
                         "idle" -> "会话空闲"
-                        "interrupted" -> "会话已中断"
-                        else -> "会话活动：${event.state}"
+                        "waiting_user" -> "等待你的输入"
+                        "cancelling" -> "正在取消…"
+                        else -> "会话活动:${event.state}"
                     }
                 )
             }
 
-            is RingingConnection.SessionEvent.InteractionRequested -> {
+            is CoreConnection.SessionEvent.InteractionRequested -> {
                 if (deviceScope != null) {
-                    // device 身份：canonical id 不出 daemon，SSE 只作立即刷新触发器
+                    // device 身份:canonical id 不出 daemon,SSE 只作立即刷新触发器
                     refreshChallengesNow()
                     return
                 }
@@ -207,7 +223,7 @@ class ConnectionService : Service() {
                 notifyApproval(approval)
             }
 
-            is RingingConnection.SessionEvent.InteractionResolved -> {
+            is CoreConnection.SessionEvent.InteractionResolved -> {
                 if (deviceScope != null) {
                     refreshChallengesNow()
                     return
@@ -217,7 +233,7 @@ class ConnectionService : Service() {
                     _pendingApprovals.value.filterNot { it.interactionId == event.resolved.interactionId }
             }
 
-            is RingingConnection.SessionEvent.InteractionExpired -> {
+            is CoreConnection.SessionEvent.InteractionExpired -> {
                 if (deviceScope != null) {
                     refreshChallengesNow()
                     return
@@ -226,10 +242,14 @@ class ConnectionService : Service() {
                 _pendingApprovals.value =
                     _pendingApprovals.value.filterNot { it.interactionId == event.interactionId }
             }
+
+            is CoreConnection.SessionEvent.DriverChanged,
+            is CoreConnection.SessionEvent.SessionTitle,
+            -> Unit
         }
     }
 
-    /** SSE 交互事件在 device 身份下的统一动作：立即拉 challenge 快照刷新列表。 */
+    /** SSE 交互事件在 device 身份下的统一动作:立即拉 challenge 快照刷新列表。 */
     private suspend fun refreshChallengesNow() {
         val conn = connection ?: return
         val sid = conn.currentSessionId() ?: return
@@ -238,7 +258,7 @@ class ConnectionService : Service() {
 
     private val summaryJson = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
 
-    /** ask 载荷（{questions:[{question,options}...]}，可能作为 JSON 字符串嵌在 text 里）→ 摘要。 */
+    /** ask 载荷({questions:[{question,options}...]},可能作为 JSON 字符串嵌在 text 里)→ 摘要。 */
     private fun askSummaryOf(element: kotlinx.serialization.json.JsonElement?): String? {
         val obj = element as? kotlinx.serialization.json.JsonObject ?: return null
         val questions = obj["questions"] as? kotlinx.serialization.json.JsonArray ?: return null
@@ -247,39 +267,40 @@ class ConnectionService : Service() {
                 ?.content?.trim()?.takeIf { it.isNotEmpty() }
         }
         if (texts.isEmpty()) return null
-        return if (texts.size == 1) texts[0] else "共 ${texts.size} 问：${texts[0]}"
+        return if (texts.size == 1) texts[0] else "共 ${texts.size} 问:${texts[0]}"
     }
 
     private suspend fun extractSummary(r: com.qaqh.harness.data.ringing.model.InteractionRequested): String {
-        // request 是 ContentValue {kind:"inline",data:{text:...}} 或 {kind:"ref",data:{content_ref:"sha256:..."}}
+        // request 是 ContentValue {kind:"inline",data:{text:...}} 或 {kind:"ref",data:{content_ref:...}}
         val data = (r.request as? kotlinx.serialization.json.JsonObject)?.get("data")
             as? kotlinx.serialization.json.JsonObject
-        android.util.Log.i("ConnectionService", "extractSummary kind=${r.kind} request=${r.request.toString().take(160)}")
-        (data?.get("text") as? kotlinx.serialization.json.JsonPrimitive)?.content?.let { text ->
-            // ask 载荷常以 JSON 字符串嵌在 text 里：能解析出 questions 就取问题文本，不透传原始 JSON
+        (data?.get("text") as? JsonPrimitive)?.content?.let { text ->
+            // ask 载荷常以 JSON 字符串嵌在 text 里:能解析出 questions 就取问题文本
             runCatching { summaryJson.parseToJsonElement(text) }.getOrNull()?.let { parsed ->
                 askSummaryOf(parsed)?.let { return it }
             }
             return text
         }
         askSummaryOf(data)?.let { return it }
-        // ref 型：拉原文（需已 attach）；原文可能是 ask 载荷 JSON、{"text":...} 或纯文本
-        val contentRef = (data?.get("content_ref") as? kotlinx.serialization.json.JsonPrimitive)?.content
+        // ref 型:拉原文;原文可能是 ask 载荷 JSON、{"text":...} 或纯文本
+        val contentRef = (data?.get("content_ref") as? JsonPrimitive)?.content
         if (contentRef != null) {
-            val sid = (_connectionState.value as? RingingConnection.State.Connected)?.clientSessionId
-            if (sid != null) {
-                val raw = runCatching { withTimeoutOrNull(5_000) { connection?.api?.content(sid, contentRef) } }.getOrNull()
-                if (!raw.isNullOrBlank()) {
-                    val parsed = runCatching { connection?.api?.json?.parseToJsonElement(raw) }.getOrNull()
-                    askSummaryOf(parsed)?.let { return it }
-                    val parsedText = (parsed as? kotlinx.serialization.json.JsonObject)
-                        ?.get("text") as? kotlinx.serialization.json.JsonPrimitive
-                    return parsedText?.content ?: raw.take(300)
-                }
+            val conn = connection ?: return fallbackSummary(r)
+            val raw = runCatching {
+                withTimeoutOrNull(5_000) { conn.client.contentText(contentRef) }
+            }.getOrNull()
+            if (!raw.isNullOrBlank()) {
+                val parsed = runCatching { summaryJson.parseToJsonElement(raw) }.getOrNull()
+                askSummaryOf(parsed)?.let { return it }
+                val parsedText = (parsed as? JsonObject)?.get("text") as? JsonPrimitive
+                return parsedText?.content ?: raw.take(300)
             }
         }
-        return r.callId ?: "工具调用请求"
+        return fallbackSummary(r)
     }
+
+    private fun fallbackSummary(r: com.qaqh.harness.data.ringing.model.InteractionRequested): String =
+        r.callId ?: "工具调用请求"
 
     // ---------- 通知 ----------
 
@@ -297,7 +318,7 @@ class ConnectionService : Service() {
             .build()
     }
 
-    private fun notifyApproval(approval: PendingApproval) {
+    fun notifyApproval(approval: PendingApproval) {
         ensureChannels()
         if (android.os.Build.VERSION.SDK_INT >= 36 && approval.expiresAtMs != null) {
             startApprovalCountdown(approval)
@@ -306,7 +327,7 @@ class ConnectionService : Service() {
         }
     }
 
-    /** Android 16 Live Update：带剩余时间进度条的审批通知，每秒刷新直到 resolved/expired。 */
+    /** Android 16 Live Update:带剩余时间进度条的审批通知,每秒刷新直到 resolved/expired。 */
     private fun startApprovalCountdown(approval: PendingApproval) {
         countdownJobs.remove(approval.interactionId)?.cancel()
         countdownJobs[approval.interactionId] = scope.launch {
@@ -328,7 +349,6 @@ class ConnectionService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val notification = if (liveUpdatePct != null && android.os.Build.VERSION.SDK_INT >= 36) {
-            // Notification.ProgressStyle（API 36+，本机 android-36 android.jar 已核对 API 面）
             val style = android.app.Notification.ProgressStyle()
                 .addProgressSegment(
                     android.app.Notification.ProgressStyle.Segment(100).setColor(0xFFB3261E.toInt())
@@ -371,7 +391,7 @@ class ConnectionService : Service() {
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_APPROVALS, "审批请求", NotificationManager.IMPORTANCE_HIGH)
         )
-        // 实时活动胶囊要求 channel importance 非 MIN/LOW（Google 示例用 DEFAULT）
+        // 实时活动胶囊要求 channel importance 非 MIN/LOW
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_TODO, "待办进度", NotificationManager.IMPORTANCE_DEFAULT)
         )
@@ -384,9 +404,10 @@ class ConnectionService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val APPROVAL_NOTIFICATION_BASE = 1000
         private const val TODO_NOTIFICATION_ID = 2
+        private const val TAG = "ConnectionService"
 
-        private val _connectionState = MutableStateFlow<RingingConnection.State>(RingingConnection.State.Disconnected)
-        val connectionState: StateFlow<RingingConnection.State> = _connectionState.asStateFlow()
+        private val _connectionState = MutableStateFlow<CoreConnection.State>(CoreConnection.State.Disconnected)
+        val connectionState: StateFlow<CoreConnection.State> = _connectionState.asStateFlow()
 
         private val _activity = MutableStateFlow<String?>(null)
         val activity: StateFlow<String?> = _activity.asStateFlow()
@@ -394,25 +415,27 @@ class ConnectionService : Service() {
         private val _pendingApprovals = MutableStateFlow<List<PendingApproval>>(emptyList())
         val pendingApprovals: StateFlow<List<PendingApproval>> = _pendingApprovals.asStateFlow()
 
-        private val _sessionInfo = MutableStateFlow<com.qaqh.harness.data.ringing.model.SessionListEntry?>(null)
-        val sessionInfo: StateFlow<com.qaqh.harness.data.ringing.model.SessionListEntry?> = _sessionInfo.asStateFlow()
+        private val _todos = MutableStateFlow<TodoState?>(null)
+        val todos: StateFlow<TodoState?> = _todos.asStateFlow()
 
-        private val _sessions = MutableStateFlow<List<com.qaqh.harness.data.ringing.model.SessionListEntry>>(emptyList())
-        val sessions: StateFlow<List<com.qaqh.harness.data.ringing.model.SessionListEntry>> = _sessions.asStateFlow()
+        private val _sessionInfo = MutableStateFlow<SessionListEntry?>(null)
+        val sessionInfo: StateFlow<SessionListEntry?> = _sessionInfo.asStateFlow()
 
-        private val _workspaces = MutableStateFlow<List<com.qaqh.harness.data.ringing.model.WorkspaceEntry>>(emptyList())
-        val workspaces: StateFlow<List<com.qaqh.harness.data.ringing.model.WorkspaceEntry>> = _workspaces.asStateFlow()
+        private val _sessions = MutableStateFlow<List<SessionListEntry>>(emptyList())
+        val sessions: StateFlow<List<SessionListEntry>> = _sessions.asStateFlow()
+
+        private val _workspaces = MutableStateFlow<List<WorkspaceEntry>>(emptyList())
+        val workspaces: StateFlow<List<WorkspaceEntry>> = _workspaces.asStateFlow()
 
         private val _refreshing = MutableStateFlow(false)
-        /** 手动/进入时刷新是否进行中（Home 下拉指示器接此状态）。 */
+        /** 手动/进入时刷新是否进行中(Home 下拉指示器接此状态)。 */
         val refreshing: StateFlow<Boolean> = _refreshing.asStateFlow()
 
-        /** 立即刷新会话列表（进入列表屏/下拉刷新时调用）；未连接时等连接就绪后再拉（最多等 10s）。 */
+        /** 立即刷新会话列表(进入列表屏/下拉刷新时调用);未连接时等连接就绪后再拉(最多等 10s)。 */
         fun refreshNow(scope: kotlinx.coroutines.CoroutineScope) {
             val conn = connection ?: return
-            // 调用方常是 UI scope（HomeScreen rememberCoroutineScope）→ 显式 IO
             scope.launch(Dispatchers.IO) {
-                if (withTimeoutOrNull(10_000) { conn.state.first { it is RingingConnection.State.Connected } } == null) {
+                if (withTimeoutOrNull(10_000) { conn.state.first { it is CoreConnection.State.Connected } } == null) {
                     return@launch
                 }
                 _refreshing.value = true
@@ -421,64 +444,171 @@ class ConnectionService : Service() {
             }
         }
 
-        private suspend fun refreshSessions(conn: RingingConnection): List<com.qaqh.harness.data.ringing.model.SessionListEntry> {
-            val sid = (_connectionState.value as? RingingConnection.State.Connected)?.clientSessionId ?: run {
-                android.util.Log.w("ConnectionService", "refresh: not connected yet")
-                return emptyList()
-            }
-            val sessions = runCatching { withTimeoutOrNull(10_000) { conn.api.sessionList(sid) } }
-                .onFailure { android.util.Log.w("ConnectionService", "sessionList failed", it) }
+        private suspend fun refreshSessions(conn: CoreConnection): List<SessionListEntry> {
+            val sessions = runCatching {
+                withTimeoutOrNull(10_000) { conn.client.sessionList() }
+            }.onFailure { android.util.Log.w(TAG, "sessionList failed: ${it.message}") }
                 .getOrNull() ?: return emptyList()
-            // 过滤 daemon 内部临时会话（.tmp* 等，bootstrap 404）
+            // 过滤 daemon 内部临时会话(.tmp* 等,bootstrap 404)
             val visible = sessions.filterNot { it.sessionId.startsWith(".") }
-            android.util.Log.i("ConnectionService", "sessions: ${sessions.size} raw, ${visible.size} visible")
             _sessions.value = visible
-            // 工作区注册表：读接口，失败静默（旧 daemon 无此方法；Home 退化为单 section）
-            val workspaces = runCatching { withTimeoutOrNull(10_000) { conn.api.workspaceList(sid) } }
-                .onFailure { android.util.Log.w(TAG, "workspaceList failed: $it") }
+            val workspaces = runCatching {
+                withTimeoutOrNull(10_000) { conn.client.workspaceList() }
+            }.onFailure { android.util.Log.w(TAG, "workspaceList failed: ${it.message}") }
                 .getOrNull()
             if (workspaces != null) _workspaces.value = workspaces
             return visible
         }
 
-        /** 用户显式选择会话（进入聊天屏时调用），覆盖自动发现的选择。 */
+        /** 用户显式选择会话(进入聊天屏时调用),覆盖自动发现的选择。 */
         fun selectSession(sessionId: String) {
             connection?.setSessionId(sessionId)
             _sessionInfo.value = _sessions.value.firstOrNull { it.sessionId == sessionId }
         }
 
         @Volatile
-        private var connection: RingingConnection? = null
+        private var connection: CoreConnection? = null
 
         @Volatile
         private var running: ConnectionService? = null
 
-        /** /pair 签发的 scope（非 null 即 device 身份，扫码配对得来）：审批走 challenge 流。 */
+        /** /pair 签发的 scope(非 null 即 device 身份,扫码配对得来):审批走 challenge 流。 */
         @Volatile
         private var deviceScope: String? = null
 
-        @Volatile
-        private var timelineStream: com.qaqh.harness.data.ringing.TimelineStream? = null
-
-        /** 会话屏直接借用当前连接（timeline/发消息）；未连接返回 null。 */
-        fun activeConnection(): RingingConnection? = connection
-
-        /** 会话屏的 timeline 消费方共用这一条流（不要再自己订一遍——见 TimelineStream）。 */
-        fun activeTimelineStream(): com.qaqh.harness.data.ringing.TimelineStream? = timelineStream
+        /** 聊天屏直接借用当前连接(timeline/发消息);未连接返回 null。 */
+        fun activeConnection(): CoreConnection? = connection
 
         private val _lastRespondError = MutableStateFlow<String?>(null)
         val lastRespondError: StateFlow<String?> = _lastRespondError.asStateFlow()
 
+        /** 设备凭据被 daemon 拒绝(吊销/token 轮换):UI 消费后应掉回配对屏。 */
+        private val _authRevoked = MutableStateFlow(false)
+        val authRevoked: StateFlow<Boolean> = _authRevoked.asStateFlow()
+
+        fun consumeAuthRevoked() {
+            _authRevoked.value = false
+        }
+
+        /** 消费审批应答错误(Snackbar 展示后调用,避免同一条重复触发)。 */
+        fun consumeRespondError() {
+            _lastRespondError.value = null
+        }
+
         /**
-         * 待办实况通知（Android 16 Live Updates / ColorOS 16 流体云胶囊）。
-         * 由 [TimelineStream.todos] 全局驱动（不再依赖聊天屏打开）：
-         * - NotificationCompat + setRequestPromotedOngoing(true) 请求胶囊提升呈现
-         *   （前提：manifest 声明 POST_PROMOTED_NOTIFICATIONS + 用户在系统设置允许，
-         *   见 [promotedOngoingEnabled]；Google platform-samples live-updates 同款配方）
-         * - API 36+ 用 ProgressStyle 分段着色（已完成绿 / 剩余灰），setShortCriticalText
-         *   供胶囊收起态显示 N/M；低版本回退普通进度条
-         * - 全部完成/无待办即取消
+         * device 身份的待审批投影源:GET /approvals 的 challenge 快照。
+         * canonical id 不出 daemon——device 模式待审批列表**整体以快照为准**,SSE 只作
+         * 立即刷新的触发器。刷新时机 = 会话发现循环每 15s + SSE 交互事件 + 应答成功后。
          */
+        private suspend fun refreshChallenges(conn: CoreConnection, sessionId: String) {
+            if (_connectionState.value !is CoreConnection.State.Connected) return
+            val approvals = runCatching {
+                withTimeoutOrNull(10_000) { conn.client.deviceChallenges(sessionId) }
+            }.onFailure {
+                android.util.Log.w(TAG, "challenges refresh failed: ${it.message}")
+            }.getOrNull() ?: return
+            val svc = running
+            val mapped = approvals.map { c ->
+                val kind = when (c.kind) {
+                    ApprovalChallenge.KIND_TOOL_PERMISSION -> InteractionKinds.PERMISSION
+                    ApprovalChallenge.KIND_ASK -> InteractionKinds.ASK
+                    ApprovalChallenge.KIND_PLAN -> InteractionKinds.PLAN
+                    else -> c.kind
+                }
+                val previous = _pendingApprovals.value.firstOrNull { it.interactionId == c.challengeId }
+                PendingApproval(
+                    interactionId = c.challengeId,
+                    kind = kind,
+                    callId = null,
+                    summary = previous?.summary ?: challengeSummaryOf(c, svc),
+                    // 首次签发时算的到期时间保留,避免每轮刷新把通知倒计时重置
+                    expiresAtMs = previous?.expiresAtMs
+                        ?: c.expiresInSeconds?.let { System.currentTimeMillis() + it * 1000 },
+                )
+            }
+            val previousList = _pendingApprovals.value
+            _pendingApprovals.value = mapped
+            // 新出现的 challenge 发通知;消失的(已消费/过期)撤面板与通知
+            mapped.filter { m -> previousList.none { it.interactionId == m.interactionId } }
+                .forEach { svc?.notifyApproval(it) }
+            previousList.filter { e -> mapped.none { it.interactionId == e.interactionId } }
+                .forEach { e ->
+                    svc?.cancelApprovalCountdown(e.interactionId)
+                    svc?.getSystemService(NotificationManager::class.java)
+                        ?.cancel(APPROVAL_NOTIFICATION_BASE + e.interactionId.hashCode())
+                }
+        }
+
+        /** challenge details → 摘要。permission 是白名单字段投影;ask/plan 是交互正文原样。 */
+        private fun challengeSummaryOf(c: ApprovalChallenge, svc: ConnectionService?): String = when (c.kind) {
+            ApprovalChallenge.KIND_TOOL_PERMISSION -> {
+                val d = c.permissionDetails
+                listOfNotNull(
+                    d?.toolName,
+                    d?.actionSummary ?: d?.reason,
+                    d?.paths?.firstOrNull(),
+                ).joinToString(" · ").ifBlank { "工具调用请求" }
+            }
+            ApprovalChallenge.KIND_ASK -> svc?.askSummaryOf(c.details) ?: "提问"
+            else -> (c.details as? JsonObject)?.let { o ->
+                listOf("plan", "text", "summary", "title").firstNotNullOfOrNull { key ->
+                    (o[key] as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
+                }
+            } ?: "计划评审"
+        }
+
+        /**
+         * 审批应答:按身份分派。
+         * - device 身份(扫码配对):走 challenge 流(一次性 opaque challenge_id);
+         * - admin/Direct(手输配对):维持 canonical 命令通道(respondInteraction)。
+         */
+        suspend fun respondApproval(
+            context: Context,
+            approval: PendingApproval,
+            approved: Boolean,
+        ): Result<CommandAck> {
+            val conn = connection ?: return Result.failure(IllegalStateException("未连接"))
+            val sessionId = conn.currentSessionId()
+                ?: return Result.failure(IllegalStateException("无目标会话"))
+            val isDevice = deviceScope != null
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    if (isDevice) {
+                        val decision = when (approval.kind) {
+                            InteractionKinds.ASK -> ApprovalDecisions.DISMISS
+                            else -> if (approved) ApprovalDecisions.APPROVE else ApprovalDecisions.REJECT
+                        }
+                        conn.client.respondDeviceApproval(sessionId, approval.interactionId, decision)
+                    } else {
+                        conn.respondInteraction(approval.kind, approval.interactionId, approval.callId, approved)
+                    }
+                }
+            }
+            result.onSuccess { ack ->
+                if (ack.status != "accepted") {
+                    _lastRespondError.value = when (ack.code) {
+                        "interaction_already_resolved" -> "该请求已被处理(电脑端已应答)"
+                        "insufficient_scope" -> "权限不足:当前设备档位无法执行该操作"
+                        else -> "命令被拒绝:${ack.code ?: ""} ${ack.message ?: ""}"
+                    }
+                } else {
+                    // 乐观移除:ack 已受理就先撤面板和通知,不等可能迟到的 SSE resolution
+                    context.getSystemService(NotificationManager::class.java)
+                        .cancel(APPROVAL_NOTIFICATION_BASE + approval.interactionId.hashCode())
+                    _pendingApprovals.value =
+                        _pendingApprovals.value.filterNot { it.interactionId == approval.interactionId }
+                    if (isDevice) {
+                        // challenge 已一次性消费:立即刷新快照(回收空位/承接新签发)
+                        runCatching { refreshChallenges(conn, sessionId) }
+                    }
+                }
+            }.onFailure { e ->
+                _lastRespondError.value = "应答失败:${e.message ?: e.javaClass.simpleName}"
+            }
+            return result
+        }
+
+        /** 待办实况通知(Android 16 Live Updates / ColorOS 16 流体云胶囊)。 */
         private fun notifyTodo(context: Context, todo: TodoState?) {
             val nm = context.getSystemService(NotificationManager::class.java)
             if (todo == null || todo.items.isEmpty() || todo.allDone) {
@@ -499,7 +629,7 @@ class ConnectionService : Service() {
                 .setOngoing(true)
                 .setRequestPromotedOngoing(true)
                 .setContentTitle("待办 ${todo.completed}/${todo.total}")
-                .setContentText(current?.let { "进行中：${it.title}" } ?: "等待开始")
+                .setContentText(current?.let { "进行中:${it.title}" } ?: "等待开始")
                 .setShortCriticalText("${todo.completed}/${todo.total}")
                 .setContentIntent(deepLink)
                 .setOnlyAlertOnce(true)
@@ -521,154 +651,18 @@ class ConnectionService : Service() {
             nm.notify(TODO_NOTIFICATION_ID, builder.build())
         }
 
-        /** 实时活动胶囊（promoted ongoing）是否已被允许发布（API 36+；ColorOS 16 流体云的前提）。 */
+        /** 实时活动胶囊(promoted ongoing)是否已被允许发布(API 36+)。 */
         fun promotedOngoingEnabled(context: Context): Boolean =
             android.os.Build.VERSION.SDK_INT >= 36 &&
                 context.getSystemService(NotificationManager::class.java).canPostPromotedNotifications()
 
-        /** 跳系统"提升的通知/实时活动"设置页（Google platform-samples live-updates 同款 intent）。 */
+        /** 跳系统"提升的通知/实时活动"设置页。 */
         fun openPromotedSettings(context: Context) {
             if (android.os.Build.VERSION.SDK_INT < 36) return
             context.startActivity(
                 Intent(Settings.ACTION_APP_NOTIFICATION_PROMOTION_SETTINGS)
                     .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
             )
-        }
-
-        private const val TAG = "ConnectionService"
-
-        /** 设备凭据被 daemon 拒绝（吊销/token 轮换）：UI 消费后应掉回配对屏。 */
-        private val _authRevoked = MutableStateFlow(false)
-        val authRevoked: StateFlow<Boolean> = _authRevoked.asStateFlow()
-
-        fun consumeAuthRevoked() {
-            _authRevoked.value = false
-        }
-
-        /** 消费审批应答错误（Snackbar 展示后调用，避免同一条重复触发）。 */
-        fun consumeRespondError() {
-            _lastRespondError.value = null
-        }
-
-        /** 审批应答：按 kind 分派；当前阶段仍用 canonical id（后端 M0 后换 opaque challenge id）。 */
-        /**
-         * device 身份的待审批投影源：GET /approvals 的 challenge 快照。
-         * canonical id 不出 daemon——SSE interaction_requested 的 id 无法与 challenge
-         * 关联、更不能用它应答，device 模式待审批列表**整体以快照为准**，SSE 只作
-         * 立即刷新的触发器。daemon 按 (kind, session, source) 去重签发，challenge_id
-         * 跨刷新稳定。刷新时机 = 会话发现循环每 15s + SSE 交互事件 + 应答成功后。
-         */
-        private suspend fun refreshChallenges(conn: RingingConnection, sessionId: String) {
-            val lease = (_connectionState.value as? RingingConnection.State.Connected)?.clientSessionId
-                ?: return
-            val approvals = runCatching {
-                withTimeoutOrNull(10_000) { conn.api.approvals(lease, sessionId) }
-            }.onFailure {
-                android.util.Log.w(TAG, "challenges refresh failed: $it")
-            }.getOrNull() ?: return
-            val svc = running
-            val mapped = approvals.challenges.map { c ->
-                val kind = when (c.kind) {
-                    ApprovalChallenge.KIND_TOOL_PERMISSION -> InteractionKinds.PERMISSION
-                    ApprovalChallenge.KIND_ASK -> InteractionKinds.ASK
-                    ApprovalChallenge.KIND_PLAN -> InteractionKinds.PLAN
-                    else -> c.kind
-                }
-                val previous = _pendingApprovals.value.firstOrNull { it.interactionId == c.challengeId }
-                PendingApproval(
-                    interactionId = c.challengeId,
-                    kind = kind,
-                    callId = null,
-                    summary = previous?.summary ?: challengeSummaryOf(c, svc),
-                    // 首次签发时算的到期时间保留，避免每轮刷新把通知倒计时重置
-                    expiresAtMs = previous?.expiresAtMs
-                        ?: c.expiresInSeconds?.let { System.currentTimeMillis() + it * 1000 },
-                )
-            }
-            val previousList = _pendingApprovals.value
-            _pendingApprovals.value = mapped
-            // 新出现的 challenge 发通知；消失的（已消费/过期）撤面板与通知
-            mapped.filter { m -> previousList.none { it.interactionId == m.interactionId } }
-                .forEach { svc?.notifyApproval(it) }
-            previousList.filter { e -> mapped.none { it.interactionId == e.interactionId } }
-                .forEach { e ->
-                    svc?.cancelApprovalCountdown(e.interactionId)
-                    svc?.getSystemService(NotificationManager::class.java)
-                        ?.cancel(APPROVAL_NOTIFICATION_BASE + e.interactionId.hashCode())
-                }
-        }
-
-        /** challenge details → 摘要。permission 是白名单字段投影；ask/plan 是交互正文原样。 */
-        private fun challengeSummaryOf(c: ApprovalChallenge, svc: ConnectionService?): String = when (c.kind) {
-            ApprovalChallenge.KIND_TOOL_PERMISSION -> {
-                val d = c.permissionDetails
-                listOfNotNull(
-                    d?.toolName,
-                    d?.actionSummary ?: d?.reason,
-                    d?.paths?.firstOrNull(),
-                ).joinToString(" · ").ifBlank { "工具调用请求" }
-            }
-            ApprovalChallenge.KIND_ASK -> svc?.askSummaryOf(c.details) ?: "提问"
-            else -> (c.details as? JsonObject)?.let { o ->
-                listOf("plan", "text", "summary", "title").firstNotNullOfOrNull { key ->
-                    (o[key] as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
-                }
-            } ?: "计划评审"
-        }
-
-        /**
-         * 审批应答：按身份分派。
-         * - device 身份（扫码配对）：走 challenge 流 `POST /approvals/respond`——一次性
-         *   opaque challenge_id（即 [PendingApproval.interactionId]），canonical id 不出
-         *   daemon，命令通道应答对 device 走不通。
-         * - admin/Direct（手输配对）：维持 canonical 命令通道（respondInteraction）。
-         */
-        suspend fun respondApproval(
-            context: Context,
-            approval: PendingApproval,
-            approved: Boolean,
-        ): Result<com.qaqh.harness.data.ringing.model.CommandAck> {
-            val conn = connection ?: return Result.failure(IllegalStateException("未连接"))
-            val sessionId = conn.currentSessionId()
-                ?: return Result.failure(IllegalStateException("无目标会话"))
-            val isDevice = deviceScope != null
-            val result = runCatching {
-                withContext(Dispatchers.IO) {
-                    if (isDevice) {
-                        val lease = (_connectionState.value as? RingingConnection.State.Connected)?.clientSessionId
-                            ?: error("未连接")
-                        val decision = when (approval.kind) {
-                            InteractionKinds.ASK -> ApprovalDecisions.DISMISS
-                            else -> if (approved) ApprovalDecisions.APPROVE else ApprovalDecisions.REJECT
-                        }
-                        conn.api.approvalRespond(lease, sessionId, approval.interactionId, decision)
-                    } else {
-                        conn.respondInteraction(approval.kind, approval.interactionId, approval.callId, approved)
-                    }
-                }
-            }
-            result.onSuccess { ack ->
-                if (ack.status != "accepted") {
-                    _lastRespondError.value = when (ack.code) {
-                        "interaction_already_resolved" -> "该请求已被处理（电脑端已应答）"
-                        "insufficient_scope" -> "权限不足：当前设备档位无法执行该操作"
-                        else -> "命令被拒绝：${ack.code ?: ""} ${ack.message ?: ""}"
-                    }
-                } else {
-                    // 乐观移除：ack 已受理就先撤面板和通知，不等可能迟到的 SSE resolution
-                    context.getSystemService(NotificationManager::class.java)
-                        .cancel(APPROVAL_NOTIFICATION_BASE + approval.interactionId.hashCode())
-                    _pendingApprovals.value =
-                        _pendingApprovals.value.filterNot { it.interactionId == approval.interactionId }
-                    if (isDevice) {
-                        // challenge 已一次性消费：立即刷新快照（回收空位/承接新签发）
-                        runCatching { refreshChallenges(conn, sessionId) }
-                    }
-                }
-            }.onFailure { e ->
-                _lastRespondError.value = "应答失败：${e.message ?: e.javaClass.simpleName}"
-            }
-            return result
         }
 
         fun start(context: Context) {

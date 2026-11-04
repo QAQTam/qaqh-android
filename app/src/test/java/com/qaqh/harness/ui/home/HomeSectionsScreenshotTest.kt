@@ -5,7 +5,7 @@ import androidx.compose.ui.test.onRoot
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.github.takahirom.roborazzi.captureRoboImage
 import com.qaqh.harness.connection.PendingApproval
-import com.qaqh.harness.data.ringing.RingingConnection
+import com.qaqh.harness.data.core.CoreConnection
 import com.qaqh.harness.ui.theme.AppTheme
 import org.junit.Rule
 import org.junit.Test
@@ -30,7 +30,7 @@ class HomeSectionsScreenshotTest {
         composeRule.setContent {
             AppTheme {
                 HomeList(
-                    state = RingingConnection.State.Connected("epoch-1", "cs-1"),
+                    state = CoreConnection.State.Connected("epoch-1", "cs-1"),
                     activity = "running",
                     pending = emptyList(),
                     currentSessionId = "s2",
@@ -47,7 +47,7 @@ class HomeSectionsScreenshotTest {
         composeRule.setContent {
             AppTheme {
                 HomeList(
-                    state = RingingConnection.State.Connected("epoch-1", "cs-1"),
+                    state = CoreConnection.State.Connected("epoch-1", "cs-1"),
                     activity = "running",
                     pending = listOf(
                         // permission 挂起 → 当前会话卡（s2）显示"等待授权"；其余卡不受全局数据污染
@@ -102,7 +102,7 @@ class HomeSectionsScreenshotTest {
         composeRule.setContent {
             AppTheme {
                 HomeList(
-                    state = RingingConnection.State.Connected("epoch-1", "cs-1"),
+                    state = CoreConnection.State.Connected("epoch-1", "cs-1"),
                     activity = null,
                     pending = emptyList(),
                     currentSessionId = null,

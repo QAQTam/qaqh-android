@@ -750,6 +750,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_qaqh_ffi_checksum_method_qaqhclient_fs_read_json(
     ): Int
+    external fun uniffi_qaqh_ffi_checksum_method_qaqhclient_lease_state(
+    ): Int
     external fun uniffi_qaqh_ffi_checksum_method_qaqhclient_plan_read_json(
     ): Int
     external fun uniffi_qaqh_ffi_checksum_method_qaqhclient_respond_ask(
@@ -842,6 +844,8 @@ internal object UniffiLib {
     external fun uniffi_qaqh_ffi_fn_method_qaqhclient_fs_list_json(`ptr`: Long,`path`: RustBuffer.ByValue,
     ): Long
     external fun uniffi_qaqh_ffi_fn_method_qaqhclient_fs_read_json(`ptr`: Long,`path`: RustBuffer.ByValue,`maxBytes`: Long,
+    ): Long
+    external fun uniffi_qaqh_ffi_fn_method_qaqhclient_lease_state(`ptr`: Long,
     ): Long
     external fun uniffi_qaqh_ffi_fn_method_qaqhclient_plan_read_json(`ptr`: Long,`sessionId`: RustBuffer.ByValue,
     ): Long
@@ -1044,6 +1048,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_qaqh_ffi_checksum_method_qaqhclient_fs_read_json() and 0xFFFF) != 62888) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_qaqh_ffi_checksum_method_qaqhclient_lease_state() and 0xFFFF) != 31935) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_qaqh_ffi_checksum_method_qaqhclient_plan_read_json() and 0xFFFF) != 29463) {
@@ -1662,6 +1669,11 @@ public interface QaqhClientInterface {
     
     suspend fun `fsReadJson`(`path`: kotlin.String, `maxBytes`: kotlin.ULong): kotlin.String
     
+    /**
+     * 当前租约状态（open 协商结果；壳层状态机的 Connected 字段来源）。
+     */
+    suspend fun `leaseState`(): LeaseState?
+    
     suspend fun `planReadJson`(`sessionId`: kotlin.String): kotlin.String
     
     /**
@@ -2125,6 +2137,29 @@ open class QaqhClient: Disposable, AutoCloseable, QaqhClientInterface
     }
 
     
+    /**
+     * 当前租约状态（open 协商结果；壳层状态机的 Connected 字段来源）。
+     */
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `leaseState`() : LeaseState? {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_qaqh_ffi_fn_method_qaqhclient_lease_state(
+                uniffiHandle,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_qaqh_ffi_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_qaqh_ffi_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.ffi_qaqh_ffi_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterOptionalTypeLeaseState.lift(it) },
+        // Error FFI converter
+        UniffiNullRustCallStatusErrorHandler,
+    )
+    }
+
+    
     @Throws(CoreException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
     override suspend fun `planReadJson`(`sessionId`: kotlin.String) : kotlin.String {
@@ -2583,6 +2618,62 @@ public object FfiConverterTypeQaqhClient: FfiConverter<QaqhClient, Long> {
 
     override fun write(value: QaqhClient, buf: ByteBuffer) {
         buf.putLong(lower(value))
+    }
+}
+
+
+
+/**
+ * 当前租约的协商结果（ClientV2SessionState 的窄投影）。
+ */
+data class LeaseState (
+    val `clientInstanceId`: kotlin.String
+    , 
+    val `clientSessionId`: kotlin.String
+    , 
+    val `serverEpoch`: kotlin.String
+    , 
+    val `leaseTtlMs`: kotlin.ULong
+    , 
+    val `renewIntervalMs`: kotlin.ULong
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeLeaseState: FfiConverterRustBuffer<LeaseState> {
+    override fun read(buf: ByteBuffer): LeaseState {
+        return LeaseState(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: LeaseState) = (
+            FfiConverterString.allocationSize(value.`clientInstanceId`) +
+            FfiConverterString.allocationSize(value.`clientSessionId`) +
+            FfiConverterString.allocationSize(value.`serverEpoch`) +
+            FfiConverterULong.allocationSize(value.`leaseTtlMs`) +
+            FfiConverterULong.allocationSize(value.`renewIntervalMs`)
+    )
+
+    override fun write(value: LeaseState, buf: ByteBuffer) {
+            FfiConverterString.write(value.`clientInstanceId`, buf)
+            FfiConverterString.write(value.`clientSessionId`, buf)
+            FfiConverterString.write(value.`serverEpoch`, buf)
+            FfiConverterULong.write(value.`leaseTtlMs`, buf)
+            FfiConverterULong.write(value.`renewIntervalMs`, buf)
     }
 }
 
@@ -3108,6 +3199,38 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         } else {
             buf.put(1)
             FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeLeaseState: FfiConverterRustBuffer<LeaseState?> {
+    override fun read(buf: ByteBuffer): LeaseState? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeLeaseState.read(buf)
+    }
+
+    override fun allocationSize(value: LeaseState?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeLeaseState.allocationSize(value)
+        }
+    }
+
+    override fun write(value: LeaseState?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeLeaseState.write(value, buf)
         }
     }
 }
