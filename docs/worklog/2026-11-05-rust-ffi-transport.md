@@ -100,3 +100,45 @@
 - 本机 git 身份补配(仓库级,同 backend:QAQTam <tsy3minso@gmail.com>)。
 - 下一步 M4:读 RingingConnection/ConnectionService/SessionTimeline/TodoState +
   UI 消费点,写 data/core(CoreClient/CoreConnection/CoreModels),删旧协议层。
+- M4 提交 2b4c6b2(android):传输层切 FFI 完成。新层 data/core 三件套 +
+  SessionTimeline v3 reducer + ConnectionService/PairingClient 重写;
+  删旧协议层 ~2.4k LOC;36/36 单测绿(含 Roborazzi 基线)。FFI 侧补
+  lease_state()(LeaseState record,Connected 状态字段来源)。
+  坑4:CoreConnection 嵌套 sealed interface SessionEvent 会遮蔽顶层契约同名类型
+  → 投影泵里用 import alias(ContractEvent);嵌套类字段引用同名嵌套类要全限定。
+  坑5:uniffi u16/u64 → Kotlin UShort/ULong(Int? 断言处 .toInt());ULong seq → .toLong()。
+  已知限制(有意):v3 无 REST 分页 → loadOlder 直达 EndReached(快照即全量);
+  exec/subagent 事件手机端暂不渲染(模型收 JsonElement,解析不失败)。
+- 下一步 M5:adb(192.168.31.111:5555) 装真机 + 本机 daemon e2e。
+
+## 真机 e2e 纪要(M5,2026-11-05 02:46-03:00)
+
+**结果:全链路真实可用。** 环境:PHK110(OnePlus,Android 16,KernelSU root,
+adb tcp 192.168.31.111:5555) × 本机 daemon(server --bind 0.0.0.0:64413,
+QAQH_DATA_DIR=/tmp/e2e/qaqh,LAN+TLS)。
+
+流程与证据:
+1. 装包:adb install;解锁=WAKEUP+dismiss-keyguard;白名单 deviceidle;权限 pm grant。
+2. 配对:桌面 curl POST /ringing/v2/pairing/tokens(loopback 明文面,注意
+   64413 是 TLS 面明文打过去会 HTTP/0.9 错)→ 构造 QR JSON → 注入调试通道
+   `am start --es qaqh_pair_payload '<json>'` → Rust pairDevice(TLS pin 生效)
+   → daemon /ringing/v2/devices 出现设备(interact)。
+3. 连接:Home 显示「已连接电脑端」(lease 协商+续租在 Rust)。
+4. 建会话:点新建会话 → daemon sessions 表 +1。
+5. 发现:15s 周期 session.list → 分组卡片「未分组 1 · 未命名会话」。
+6. 聊天:进屏 attach+bootstrap+单流;input text + 发送 → 命令受理,turns/blocks
+   落库;**气泡来自 TimelineAppended 事件回推(零乐观刷新,纯 SSE 路径)**。
+7. 未验证项:真模型回合(本机 daemon 未配 provider,发消息后 turn 不跑——传输
+   层已闭环,模型链路属于 daemon 配置问题);审批 challenge 流(单测覆盖,真机
+   需要一个正在跑的工具请求才能触发)。
+
+**三个真机坑(都已修):**
+- `libc++_shared.so` 缺失 → dlopen 崩:build-core.sh 从 NDK sysroot 拷入 jniLibs。
+- `there is no reactor running`:uniffi 导出必须标 `async_runtime = "tokio"`
+  (async_compat::Compat 才会包 future 给出 tokio 上下文),后端仓 e39fa49a。
+- 主屏新建会话静默失败:createSession 误走 driver 恢复路径要求 seed →
+  Global 命令直发(38d7325)。
+
+**留给用户:** daemon 仍在跑(/tmp/e2e/qaqh,token 在 /tmp/e2e/token.env);
+手机已配对可直接继续体验;配 provider 后即可真模型对话。重启 daemon 后
+手机端走既有 device_token 自动重连(daemon.json 换 epoch 会触发重协商)。

@@ -180,3 +180,32 @@
 
 - 版本尽量最新稳定版；原生设计（Compose），克制复用系统组件
 - 决策已定：扫码配对；后端允许分阶段小改
+
+---
+
+# 2026-11-05 会话:传输层整体切换 Rust core(FFI)——真机 e2e 全通
+
+完整工作痕迹见 `docs/worklog/2026-11-05-rust-ffi-transport.md`(本条是索引)。
+
+- **决策**:2026-10-05 预案翻转条件成立(backend v3 断链:命令信封/路由/timeline
+  端点退役/事件词表重造),传输层整体切 `crates/qaqh-ffi`(uniffi)绑
+  `qaqh-client`;删 ~2.4k LOC Kotlin 协议孪生;UI 层零改动。
+- **后端仓提交**:2c6d53ea(client:tls_fp pin/pair_remote/device approvals)、
+  dca885d6(qaqh-ffi 绑定层)、e39fa49a(async_runtime=tokio + lease_state)。
+- **本仓提交**:64d710e(build-core.sh + JNA)、2b4c6b2(data/core 三件套 +
+  v3 reducer + 删旧层)、38d7325(真机三坑:libc++_shared/async_runtime/
+  createSession 无 seed)。
+- **坑清单**(压缩存活用):①错误变体字段禁用名 `message`(撞 Throwable)、
+  导出方法禁用名 `close`(撞 Disposable);②`--library` 模式要显式
+  `--config uniffi-global.toml`;③uniffi u16/u64 → UShort/ULong;④.so 依赖
+  libc++_shared.so 必须随包;⑤导出必须 `async_runtime = "tokio"`;⑥CoreConnection
+  嵌套 `SessionEvent` 遮蔽顶层契约类型(import alias 解);⑦daemon loopback
+  明文面是随机端口,64413 是 TLS 面(明文 curl 会 HTTP/0.9 错)。
+- **e2e 证据**:配对(设备注册 interact)→ 连接 → 建会话(落库)→ 发现分组 →
+  聊天(attach+bootstrap+单流)→ 发消息(命令受理+落库+事件回推气泡上屏)。
+  未验证:真模型回合(daemon 未配 provider)、审批 challenge 真机触发。
+- **构建环境**:SDK/NDK 在 `../hiandroid`(env.sh);NDK 30.0.16248370;
+  rust targets aarch64/x86_64-linux-android;cargo-ndk 4.1.2;本机 8G 内存
+  (gradle daemon 2.5G 大户,构建后 --stop)。
+- **遗留**:v3 无 REST 分页 → loadOlder 直达 EndReached;exec/subagent 事件
+  暂不渲染(模型收 JsonElement);审批 challenge 真机流程待真实工具请求触发。

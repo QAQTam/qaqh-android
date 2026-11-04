@@ -92,3 +92,19 @@ app/src/main/java/com/qaqh/harness/
 
 - `gradlew assembleDebug` 通过 + MockWebServer 协议回环测试通过
 - 真机与电脑端同一局域网：扫码配对 → 看到会话实时状态 → 收到审批通知 → 手机上完成一次同意/拒绝
+
+## 决策记录(2026-11-05):传输层切换 Rust core(FFI)
+
+2026-10-05 决策记录预设的翻转条件已成立:backend v3 改造(命令信封/统一
+commands 路由/timeline 端点退役/15→20 事件词表/resync 改名)使纯 Kotlin 协议
+层断链(首条命令即 404),双份维护成本越过阈值。按预案执行:
+
+- 新增后端仓 `crates/qaqh-ffi`(uniffi 0.32,proc-macro,tokio):控制面窄类型
+  + 数据面 JSON passthrough;`qaqh-client` 增补 pair_remote / tls_fp pin /
+  device approvals 三件(2c6d53ea)。
+- Android 侧 `data/core` 三件套(CoreModels/CoreClient/CoreConnection)+
+  SessionTimeline v3 reducer(UI 形状不变);删 ~2.4k LOC 协议孪生(2b4c6b2)。
+- 预案中的验收路径照兑现:MockWebServer wire 测试退役,新单测以
+  qaqh-sdk fixtures 与 v3 事件词表为 oracle;真机 e2e 全链路通过
+  (docs/worklog/2026-11-05-rust-ffi-transport.md)。
+- 鸿蒙侧后续同样以 `qaqh-ffi` 为基座(NAPI 镜像层),与本决策同源。
