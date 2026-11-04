@@ -38,12 +38,16 @@ FLAGS=(--lib -p qaqh-ffi)
     -o "$PROJ/app/src/main/jniLibs" \
     build "${FLAGS[@]}")
 
-# ── strip(.so 去调试符号;debug 从 ~200MB 缩到 ~30MB,装机 e2e 必需)──────
+# ── strip + C++ 运行时 ──────────────────────────────────────────────────
+# libqaqh_ffi.so 依赖 libc++_shared.so(NDK clang 链接的 C++ 运行时),必须随包。
 NDK_DIR=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)
 STRIP="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+declare -A ABI_MAP=( ["arm64-v8a"]="aarch64-linux-android" ["x86_64"]="x86_64-linux-android" )
 for abi in "${ABIS[@]}"; do
     so="$PROJ/app/src/main/jniLibs/$abi/libqaqh_ffi.so"
     [ -f "$so" ] && "$STRIP" "$so"
+    cp "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${ABI_MAP[$abi]}/libc++_shared.so" \
+       "$PROJ/app/src/main/jniLibs/$abi/libc++_shared.so"
 done
 
 # ── Kotlin 绑定 ─────────────────────────────────────────────────────────

@@ -65,6 +65,11 @@ import dev.chrisbanes.haze.hazeSource
 import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {
+    companion object {
+        /** 调试配对通道的 intent extra 名(仅 DEBUG 生效,见 AppRoot)。 */
+        const val EXTRA_PAIR_PAYLOAD = "qaqh_pair_payload"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -100,6 +105,34 @@ fun AppRoot(modifier: Modifier = Modifier) {
     val deviceName = remember { "${Build.MODEL}（Android）" }
     val client = remember(deviceName) { PairingClient(deviceName) }
 
+    // 调试通道:adb `am start --es qaqh_pair_payload '<json|qaqh://pair?...>'` 直通配对
+    // 流程(与扫码/手输同一条路,免真人扫码);仅 DEBUG 构建启用。
+    val debugPayload = if (com.qaqh.harness.BuildConfig.DEBUG) {
+        (context as? android.app.Activity)?.intent?.getStringExtra(MainActivity.EXTRA_PAIR_PAYLOAD)
+    } else {
+        null
+    }
+
+    fun runPair(raw: String) {
+        if (pairing) return
+        pairing = true
+        error = null
+        scope.launch {
+            try {
+                val payload = PairingPayload.parse(raw)
+                val creds = client.pair(payload)
+                store.save(creds)
+                credentials = creds
+            } catch (e: PairingPayloadException) {
+                error = e.message
+            } catch (e: Exception) {
+                error = "配对失败：${e.message}"
+            } finally {
+                pairing = false
+            }
+        }
+    }
+
     // 审批通知需要运行时通知权限（API 33+）
     val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
     LaunchedEffect(Unit) {
@@ -114,6 +147,13 @@ fun AppRoot(modifier: Modifier = Modifier) {
     // 已配对则拉起前台连接服务
     LaunchedEffect(credentials) {
         if (credentials != null) ConnectionService.start(context)
+    }
+
+    // 调试配对通道:消费一次 intent extra(与扫码同一条解析/执行路径)
+    LaunchedEffect(debugPayload) {
+        val raw = debugPayload ?: return@LaunchedEffect
+        (context as? android.app.Activity)?.intent?.removeExtra(MainActivity.EXTRA_PAIR_PAYLOAD)
+        runPair(raw)
     }
 
     // 两级导航：tab 壳 ↔ 聊天屏（聊天全屏覆盖 tab，自带返回）
@@ -134,26 +174,7 @@ fun AppRoot(modifier: Modifier = Modifier) {
         PairingScreen(
             pairing = pairing,
             error = error,
-            onPayload = { raw ->
-                if (!pairing) {
-                    pairing = true
-                    error = null
-                    scope.launch {
-                        try {
-                            val payload = PairingPayload.parse(raw)
-                            val creds = client.pair(payload)
-                            store.save(creds)
-                            credentials = creds
-                        } catch (e: PairingPayloadException) {
-                            error = e.message
-                        } catch (e: Exception) {
-                            error = "配对失败：${e.message}"
-                        } finally {
-                            pairing = false
-                        }
-                    }
-                }
-            },
+            onPayload = ::runPair,
             onManual = { endpoint, token, tlsFp ->
                 if (!pairing) {
                     pairing = true

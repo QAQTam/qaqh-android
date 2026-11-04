@@ -140,9 +140,8 @@ class CoreConnection(
     suspend fun sendUserMessage(text: String): CommandAck =
         sendWithDriverRecovery { seed -> client.sendMessage(seed, text) }
 
-    /** 新建会话(Global 命令);not_driver 恢复策略同 sendUserMessage。 */
-    suspend fun createSession(): CommandAck =
-        sendWithDriverRecovery { _ -> client.createSession() }
+    /** 新建会话(Global 命令,daemon 直执行不经 driver 门,也不需要已选会话)。 */
+    suspend fun createSession(): CommandAck = client.createSession()
 
     /** 按交互类型应答(admin/Direct 身份的 canonical 命令通道)。 */
     suspend fun respondInteraction(
