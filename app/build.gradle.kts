@@ -61,6 +61,8 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.core)
+    // UniFFI 生成绑定(ffi 包)的运行时依赖;@aar 指 Android 形态
+    implementation("net.java.dev.jna:jna:5.17.0@aar")
     implementation(libs.androidx.camera.camera2)
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)

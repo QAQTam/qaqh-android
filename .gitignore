@@ -12,3 +12,6 @@ tmp/
 
 # ZCode session-local state
 .zcode/
+
+# Rust core 产物(build-core.sh 重生成;.kt 绑定入库,.so 不入库)
+app/src/main/jniLibs/
