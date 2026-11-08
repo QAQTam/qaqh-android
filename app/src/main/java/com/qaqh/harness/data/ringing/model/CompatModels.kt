@@ -5,6 +5,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 /**
  * 旧 RingingModels.kt 拆解后的存量兼容模型:这些类型被 UI 分组/审批/会话列表
@@ -93,6 +94,7 @@ object InteractionKinds {
  * SessionGrouping 零改动消费;request 原样携带(ContentValue JSON)。
  */
 data class InteractionRequested(
+    val sessionId: String,
     val interactionId: String,
     val callId: String?,
     val kind: String,
@@ -128,6 +130,9 @@ data class ApprovalChallenge(
     @SerialName("expires_in") val expiresInSeconds: Long? = null,
     val details: JsonElement? = null,
 ) {
+    val detailsUnavailable: Boolean
+        get() = (details as? JsonObject)?.get("details_unavailable") == JsonPrimitive(true)
+
     /** permission 白名单投影;ask/plan 的 details 是交互正文原样,不走这里。 */
     val permissionDetails: ApprovalChallengeDetails?
         get() = (details as? JsonObject)?.let {
@@ -159,6 +164,31 @@ data class ApprovalChallengeDetails(
 /** challenges 列表响应体(RingingV2DeviceChallenges)。 */
 @Serializable
 data class DeviceChallengesResponse(val challenges: List<ApprovalChallenge> = emptyList())
+
+/** Ringing Ask request body, normalized by the backend from the model's ASK v1 input. */
+@Serializable
+data class AskForm(val questions: List<AskQuestion>) {
+    val summary: String
+        get() = if (questions.size == 1) questions.first().question
+        else "共 ${questions.size} 问：${questions.first().question}"
+}
+
+@Serializable
+data class AskQuestion(
+    val id: String,
+    val question: String,
+    val options: List<String>,
+    @SerialName("allow_custom") val allowCustom: Boolean,
+)
+
+@Serializable
+data class AskAnswer(
+    @SerialName("question_id") val questionId: String,
+    val answer: String,
+)
+
+@Serializable
+data class AskSubmission(val answers: List<AskAnswer>)
 
 /**
  * `POST /approvals/respond` 的决策枚举(daemon command_for 固定集合):

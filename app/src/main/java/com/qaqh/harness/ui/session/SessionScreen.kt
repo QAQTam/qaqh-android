@@ -2,6 +2,7 @@
 
 package com.qaqh.harness.ui.session
 
+import androidx.activity.compose.LocalActivity
 import androidx.compose.foundation.background
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -29,14 +30,16 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.CircularWavyProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -64,6 +67,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -74,6 +78,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.fragment.app.FragmentActivity
 import com.mikepenz.markdown.compose.components.markdownComponents
 import com.mikepenz.markdown.compose.elements.highlightedCodeBlock
 import com.mikepenz.markdown.compose.elements.highlightedCodeFence
@@ -84,12 +89,13 @@ import com.qaqh.harness.connection.ConnectionService
 import com.qaqh.harness.connection.PendingApproval
 import com.qaqh.harness.data.core.CoreConnection
 import com.qaqh.harness.data.ringing.SessionTimeline
+import com.qaqh.harness.data.ringing.model.AskAnswer
 import com.qaqh.harness.data.ringing.model.TimelineBlock
 import com.qaqh.harness.data.ringing.model.TimelineTool
 import com.qaqh.harness.data.ringing.model.TimelineTurn
+import androidx.compose.ui.text.font.FontFamily
 import com.qaqh.harness.ui.home.ActivityView
 import com.qaqh.harness.ui.home.activityViewOf
-import com.qaqh.harness.ui.theme.AppMono
 import com.qaqh.harness.ui.approvals.authenticateForApproval
 import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.launch
@@ -98,7 +104,6 @@ import kotlinx.coroutines.launch
 private val ScreenPadding = 16.dp
 private val BlockSpacing = 8.dp
 private val CardInnerPadding = 12.dp
-private val BubbleRadius = 12.dp
 
 /** 流式追底的尾沿采样间隔（每次滚动都要重排长 item，限频在此）。 */
 private const val FOLLOW_INTERVAL_MS = 80L
@@ -125,7 +130,8 @@ fun SessionScreen(
     val turns by timeline.turns.collectAsState()
     val status by timeline.status.collectAsState()
     val todos by timeline.todos.collectAsState()
-    val approvals by ConnectionService.pendingApprovals.collectAsState()
+    val pendingApprovals by ConnectionService.pendingApprovals.collectAsState()
+    val approvals = pendingApprovals.filter { it.sessionId == sessionId }
     val respondError by ConnectionService.lastRespondError.collectAsState()
     val sendError by timeline.sendError.collectAsState()
     val activity by ConnectionService.activity.collectAsState()
@@ -384,7 +390,7 @@ fun SessionScreen(
                 placeholder = { Text("发送消息…") },
                 modifier = Modifier.weight(1f),
                 maxLines = 4,
-                shape = RoundedCornerShape(28.dp),
+                shape = MaterialTheme.shapes.extraLarge,
                 colors = OutlinedTextFieldDefaults.colors(
                     unfocusedBorderColor = MaterialTheme.colorScheme.surfaceVariant,
                     focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
@@ -558,7 +564,7 @@ private fun TurnItem(turn: TimelineTurn) {
                     userText,
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier
-                        .clip(RoundedCornerShape(BubbleRadius))
+                        .clip(MaterialTheme.shapes.small)
                         .background(MaterialTheme.colorScheme.primaryContainer)
                         .padding(horizontal = CardInnerPadding, vertical = 8.dp),
                 )
@@ -636,7 +642,7 @@ private fun ProcessChip(
 ) {
     Surface(
         onClick = onClick,
-        shape = RoundedCornerShape(16.dp),
+        shape = MaterialTheme.shapes.medium,
         color = MaterialTheme.colorScheme.surfaceVariant,
         modifier = Modifier.fillMaxWidth(),
     ) {
@@ -717,9 +723,7 @@ private fun BlockItem(block: TimelineBlock) {
                         bullet = MaterialTheme.typography.bodyMedium,
                         list = MaterialTheme.typography.bodyMedium,
                         table = MaterialTheme.typography.bodyMedium,
-                        // 库默认 FontFamily.Monospace（系统等宽），与 AppMono（Cascadia）不一致
-                        code = MaterialTheme.typography.bodyMedium.copy(fontFamily = AppMono),
-                        inlineCode = MaterialTheme.typography.bodyMedium.copy(fontFamily = AppMono),
+                        // code/inlineCode 不传 = 库默认 FontFamily.Monospace(系统等宽)
                     ),
                     // components 一旦传入即覆盖 m3 默认（含其 checkbox），故 checkbox 需一并补齐
                     components = markdownComponents(
@@ -821,7 +825,8 @@ private fun ToolCard(tool: TimelineTool) {
             // 头部：状态 + 动词 + 单行正文 + 时长/状态
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(BlockSpacing)) {
                 if (running) {
-                    CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 2.dp)
+                    // M3E 波浪圆(稳定 API):运行中 = 波形流动,与终态静点区分
+                    CircularWavyProgressIndicator(Modifier.size(16.dp))
                 } else {
                     Box(Modifier.size(8.dp).clip(CircleShape).background(dotColor))
                 }
@@ -854,12 +859,12 @@ private fun ToolCard(tool: TimelineTool) {
                 body?.let { text ->
                     Text(
                         text,
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = com.qaqh.harness.ui.theme.AppMono),
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                         maxLines = 200,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
+                            .clip(MaterialTheme.shapes.extraSmall)
                             .background(MaterialTheme.colorScheme.surfaceVariant)
                             .padding(8.dp),
                     )
@@ -878,7 +883,7 @@ private fun ToolCard(tool: TimelineTool) {
                     tool.argsJson?.takeIf { it.isNotBlank() }?.let {
                         Text(
                             it,
-                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = com.qaqh.harness.ui.theme.AppMono),
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 40,
                             overflow = TextOverflow.Ellipsis,
@@ -893,7 +898,7 @@ private fun ToolCard(tool: TimelineTool) {
                 Column(
                     Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
+                        .clip(MaterialTheme.shapes.extraSmall)
                         .background(MaterialTheme.colorScheme.surfaceVariant)
                         .padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalArrangement = Arrangement.spacedBy(1.dp),
@@ -901,7 +906,7 @@ private fun ToolCard(tool: TimelineTool) {
                     lines.forEach { line ->
                         Text(
                             line,
-                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = com.qaqh.harness.ui.theme.AppMono),
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
@@ -928,7 +933,7 @@ private fun DiffView(diff: String) {
     Column(
         Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
+            .clip(MaterialTheme.shapes.extraSmall)
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .padding(8.dp),
     ) {
@@ -942,7 +947,7 @@ private fun DiffView(diff: String) {
             }
             Text(
                 line,
-                style = MaterialTheme.typography.bodySmall.copy(fontFamily = com.qaqh.harness.ui.theme.AppMono),
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                 color = color,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -962,7 +967,7 @@ private fun ApprovalStrip(approvals: List<PendingApproval>, modifier: Modifier =
     val first = approvals.first()
     Surface(
         onClick = { showSheet = true },
-        shape = RoundedCornerShape(16.dp),
+        shape = MaterialTheme.shapes.medium,
         color = MaterialTheme.colorScheme.tertiaryContainer,
         modifier = modifier.fillMaxWidth(),
     ) {
@@ -999,7 +1004,8 @@ private fun ApprovalStrip(approvals: List<PendingApproval>, modifier: Modifier =
     if (showSheet) {
         ModalBottomSheet(onDismissRequest = { showSheet = false }) {
             Column(
-                Modifier.fillMaxWidth().padding(horizontal = ScreenPadding).padding(bottom = 24.dp),
+                Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+                    .padding(horizontal = ScreenPadding).padding(bottom = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(BlockSpacing),
             ) {
                 approvals.forEach { ApprovalCard(it) }
@@ -1019,37 +1025,60 @@ private fun kindLabel(kind: String): String = when (kind) {
 @Composable
 fun ApprovalCard(approval: PendingApproval, modifier: Modifier = Modifier) {
     val context = LocalContext.current
+    val activity = LocalActivity.current as? FragmentActivity
     val scope = rememberCoroutineScope()
     var busy by remember(approval.interactionId) { mutableStateOf(false) }
+    var authError by remember(approval.interactionId) { mutableStateOf<String?>(null) }
+    val selectedOptions = remember(approval.interactionId) { mutableStateMapOf<String, String>() }
+    val customAnswers = remember(approval.interactionId) { mutableStateMapOf<String, String>() }
+    val questions = approval.askForm?.questions.orEmpty()
+    val answers = questions.map { question ->
+        AskAnswer(question.id, selectedOptions[question.id] ?: customAnswers[question.id].orEmpty().trim())
+    }
 
-    fun respondWithGate(approved: Boolean) {
+    fun respondWithGate(approved: Boolean, submission: List<AskAnswer>? = null) {
+        busy = true
+        authError = null
         val verb = when (approval.kind) {
             "plan" -> if (approved) "批准计划" else "拒绝计划"
             "ask" -> "关闭提问"
             else -> if (approved) "同意" else "拒绝"
         }
-        val fragmentActivity = context as? androidx.fragment.app.FragmentActivity
         fun proceed() {
             scope.launch {
-                ConnectionService.respondApproval(context, approval, approved)
-                busy = false
+                try {
+                    ConnectionService.respondApproval(context, approval, approved, submission)
+                } finally {
+                    busy = false
+                }
             }
         }
-        // 只有放行/拒绝类操作需要生物认证；ask 的"关闭（中止回合）"不是授权行为，
-        // 不该要求指纹/密码
-        if (approval.kind == "ask" || fragmentActivity == null) {
+        // 只有授权和计划评审经过生物认证。
+        if (approval.kind == "ask") {
             proceed()
             return
         }
-        fragmentActivity.authenticateForApproval(
+        if (activity == null) {
+            authError = "无法启动身份验证"
+            busy = false
+            return
+        }
+        activity.authenticateForApproval(
             title = "确认$verb",
             subtitle = approval.summary.take(60),
             onAllowed = ::proceed,
-            onDenied = { busy = false },
+            onDenied = { message ->
+                authError = message.toString()
+                busy = false
+            },
         )
     }
 
-    Card(modifier) {
+    // 审批卡 = app 核心工作流,容器抬一档从列表背景里浮出;强调由 filled 按钮承担
+    Card(
+        modifier,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+    ) {
         Column(Modifier.padding(CardInnerPadding), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(
                 when (approval.kind) {
@@ -1059,29 +1088,70 @@ fun ApprovalCard(approval: PendingApproval, modifier: Modifier = Modifier) {
                 },
                 style = MaterialTheme.typography.titleSmall,
             )
-            Text(
-                approval.summary,
-                style = MaterialTheme.typography.bodyMedium,
-                maxLines = 6,
-                overflow = TextOverflow.Ellipsis,
-            )
+            if (approval.detailsUnavailable) {
+                Text("详情不可用", color = MaterialTheme.colorScheme.error)
+            } else if (questions.isEmpty()) {
+                Text(
+                    approval.summary,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 6,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            } else {
+                questions.forEach { question ->
+                    Text(question.question, style = MaterialTheme.typography.bodyMedium)
+                    question.options.forEach { option ->
+                        FilterChip(
+                            selected = selectedOptions[question.id] == option,
+                            onClick = {
+                                selectedOptions[question.id] = option
+                                customAnswers.remove(question.id)
+                            },
+                            label = { Text(option) },
+                            enabled = !busy,
+                        )
+                    }
+                    if (question.allowCustom) {
+                        OutlinedTextField(
+                            value = customAnswers[question.id].orEmpty(),
+                            onValueChange = { answer ->
+                                customAnswers[question.id] = answer
+                                selectedOptions.remove(question.id)
+                            },
+                            label = { Text(if (question.options.isEmpty()) "回答" else "自定义回答") },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !busy,
+                        )
+                    }
+                }
+            }
+            authError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             Row(horizontalArrangement = Arrangement.spacedBy(BlockSpacing)) {
                 when (approval.kind) {
-                    "ask" -> OutlinedButton(
-                        enabled = !busy,
-                        onClick = { busy = true; respondWithGate(false) },
-                        modifier = Modifier.weight(1f),
-                    ) { Text("关闭（中止回合）") }
+                    "ask" -> {
+                        if (questions.isNotEmpty() && !approval.detailsUnavailable) {
+                            Button(
+                                enabled = !busy && answers.all { it.answer.isNotBlank() },
+                                onClick = { respondWithGate(false, answers) },
+                                modifier = Modifier.weight(1f),
+                            ) { Text("提交回答") }
+                        }
+                        OutlinedButton(
+                            enabled = !busy,
+                            onClick = { respondWithGate(false) },
+                            modifier = Modifier.weight(1f),
+                        ) { Text("关闭提问") }
+                    }
 
                     else -> {
                         Button(
-                            enabled = !busy,
-                            onClick = { busy = true; respondWithGate(true) },
+                            enabled = !busy && !approval.detailsUnavailable,
+                            onClick = { respondWithGate(true) },
                             modifier = Modifier.weight(1f),
                         ) { Text("同意") }
                         OutlinedButton(
                             enabled = !busy,
-                            onClick = { busy = true; respondWithGate(false) },
+                            onClick = { respondWithGate(false) },
                             modifier = Modifier.weight(1f),
                         ) { Text("拒绝") }
                     }

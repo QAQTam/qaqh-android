@@ -52,6 +52,7 @@ class HomeSectionsScreenshotTest {
                     pending = listOf(
                         // permission 挂起 → 当前会话卡（s2）显示"等待授权"；其余卡不受全局数据污染
                         PendingApproval(
+                            sessionId = "s2",
                             interactionId = "int-1",
                             kind = "permission",
                             callId = null,

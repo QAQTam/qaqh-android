@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3ExpressiveApi::class)
+
 package com.qaqh.harness.ui.pairing
 
 import android.Manifest
@@ -19,7 +21,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ContainedLoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -83,7 +85,8 @@ fun PairingScreen(
                 contentAlignment = Alignment.Center,
             ) {
                 QrCameraPreview(onQrText = onPayload)
-                if (pairing) CircularProgressIndicator()
+                // M3E 招牌加载器:圆容器内多边形形变轮换,容器色自带对比度(压在相机画面上可读)
+                if (pairing) ContainedLoadingIndicator()
             }
         } else {
             Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {

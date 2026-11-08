@@ -13,7 +13,7 @@ fun FragmentActivity.authenticateForApproval(
     title: String,
     subtitle: String,
     onAllowed: () -> Unit,
-    onDenied: () -> Unit = {},
+    onDenied: (CharSequence) -> Unit,
 ) {
     val prompt = BiometricPrompt(
         this,
@@ -24,7 +24,7 @@ fun FragmentActivity.authenticateForApproval(
             }
 
             override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                onDenied()
+                onDenied(errString)
             }
         },
     )

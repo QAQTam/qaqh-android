@@ -5,9 +5,12 @@ plugins {
     alias(libs.plugins.roborazzi) // JVM 截图回归（Robolectric 渲染，无需设备）
 }
 
+val coreAbis = listOf("arm64-v8a", "x86_64")
+
 android {
     namespace = "com.qaqh.harness"
     compileSdk = 37
+    ndkVersion = "30.0.16248370"
 
     defaultConfig {
         applicationId = "com.qaqh.harness"
@@ -15,6 +18,7 @@ android {
         targetSdk = 36
         versionCode = 3
         versionName = "3.0.0-alpha.1"
+        ndk.abiFilters.addAll(coreAbis)
     }
 
     buildTypes {
@@ -24,6 +28,14 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+        }
+    }
+    sourceSets {
+        named("main") { jniLibs.directories.clear() }
+        listOf("debug", "release").forEach { profile ->
+            named(profile) {
+                jniLibs.directories.add(layout.buildDirectory.dir("rust-core/$profile/jniLibs").get().asFile.path)
+            }
         }
     }
     compileOptions {
@@ -38,6 +50,24 @@ android {
         unitTests {
             isIncludeAndroidResources = true
         }
+    }
+}
+
+listOf("debug", "release").forEach { profile ->
+    val variant = profile.replaceFirstChar { it.uppercaseChar() }
+    val core = layout.buildDirectory.dir("rust-core/$profile/jniLibs")
+    val verifyCore = tasks.register("verify${variant}RustCore") {
+        doLast {
+            val missing = coreAbis.flatMap { abi ->
+                listOf("$abi/libqaqh_ffi.so", "$abi/libc++_shared.so")
+            }.filterNot { core.get().file(it).asFile.isFile }
+            check(missing.isEmpty()) {
+                "Missing Rust core libraries (${missing.joinToString()}). Run ./core/build-core.sh $profile first."
+            }
+        }
+    }
+    tasks.matching { it.name == "merge${variant}JniLibFolders" }.configureEach {
+        dependsOn(verifyCore)
     }
 }
 

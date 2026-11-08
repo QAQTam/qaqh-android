@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3ExpressiveApi::class)
+
 package com.qaqh.harness.ui.home
 
 import androidx.compose.animation.core.RepeatMode
@@ -20,14 +22,17 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.MaterialShapes
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
+import androidx.compose.material3.toShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -41,8 +46,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.qaqh.harness.connection.ConnectionService
 import com.qaqh.harness.connection.PendingApproval
@@ -55,8 +62,8 @@ import kotlinx.coroutines.launch
 private val ScreenPadding = 16.dp
 private val BlockSpacing = 12.dp
 private val CardInnerPadding = 16.dp
-private val CardCorner = 24.dp
 private val StatusDotSize = 10.dp
+private val AttentionDotSize = 14.dp
 
 @Composable
 fun HomeScreen(
@@ -73,6 +80,7 @@ fun HomeScreen(
     val refreshing by ConnectionService.refreshing.collectAsState()
     val scope = rememberCoroutineScope()
     var creating by remember { mutableStateOf(false) }
+    val snackbar = remember { SnackbarHostState() }
 
     // 进入列表屏立即刷新一次（不等 15s 兜底轮询）
     LaunchedEffect(Unit) { ConnectionService.refreshNow(scope) }
@@ -84,9 +92,20 @@ fun HomeScreen(
         val conn = ConnectionService.activeConnection() ?: return
         creating = true
         scope.launch {
-            runCatching { conn.createSession() }
-            ConnectionService.refreshNow(scope)
-            creating = false
+            try {
+                val ack = conn.createSession()
+                if (ack.status == "accepted") {
+                    ConnectionService.refreshNow(scope)
+                } else {
+                    snackbar.showSnackbar(ack.message ?: "创建会话失败")
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                snackbar.showSnackbar(e.message ?: "创建会话失败")
+            } finally {
+                creating = false
+            }
         }
     }
 
@@ -100,7 +119,7 @@ fun HomeScreen(
             HomeList(
                 state = state,
                 activity = activity,
-                pending = pending,
+                pending = pending.filter { it.sessionId == sessionInfo?.sessionId },
                 currentSessionId = sessionInfo?.sessionId,
                 sections = sections,
                 onOpenSession = onOpenSession,
@@ -110,11 +129,15 @@ fun HomeScreen(
                 onClick = {
                     if (!creating && state is CoreConnection.State.Connected) createSession()
                 },
-                shape = RoundedCornerShape(20.dp),
+                shape = MaterialTheme.shapes.large,
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .padding(end = ScreenPadding, bottom = GlassNavBarContentPadding - 24.dp),
             ) { Text(if (creating) "创建中…" else "新建会话") }
+            SnackbarHost(
+                hostState = snackbar,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = GlassNavBarContentPadding),
+            )
         }
     }
 }
@@ -177,6 +200,7 @@ fun HomeList(
                     liveActivity = if (isCurrent) activity else null,
                     pending = if (isCurrent) pending else emptyList(),
                     session = entry,
+                    current = isCurrent,
                     modifier = Modifier.fillMaxWidth(),
                     onClick = { onOpenSession(entry.sessionId) },
                 )
@@ -267,26 +291,33 @@ private fun EmptySessions(modifier: Modifier = Modifier) {
  * 会话卡片（M3 Expressive 大圆角 tonal 卡）：LLM 生成的工作区标题做主标题，
  * 相对时间进 meta 行；状态 = 活动视图（新 daemon 以 session.list status 8 态为准，
  * 当前会话用 SSE live/pending 实时覆盖；旧 daemon 本地推导）+ 呼吸点。
+ * 表面三档：普通 surfaceContainer / 当前挂接（SSE live）surfaceContainerHigh /
+ * 等待介入 tertiaryContainer 药丸（与 SessionScreen ApprovalStrip 同色系）。
  */
 @Composable
 private fun SessionCard(
     liveActivity: String?,
     pending: List<PendingApproval>,
     session: com.qaqh.harness.data.ringing.model.SessionListEntry,
+    current: Boolean,
     modifier: Modifier = Modifier,
     onClick: () -> Unit = {},
 ) {
     val view = activityViewOf(session, liveActivity, pending)
-    // 需要用户介入（等待授权/回答/评审）与执行中一样用呼吸点——都是"有事发生"
-    val attention = view == ActivityView.WORKING ||
-        view == ActivityView.WAITING_PERMISSION ||
+    // 等待用户介入（授权/回答/评审）= "需要你"，药丸强调；执行中也是"有事发生"（呼吸）
+    val waiting = view == ActivityView.WAITING_PERMISSION ||
         view == ActivityView.WAITING_ASK ||
         view == ActivityView.WAITING_PLAN
+    val attention = view == ActivityView.WORKING || waiting
     Card(
         modifier = modifier.clickable(onClick = onClick, role = Role.Button),
-        shape = RoundedCornerShape(CardCorner),
+        shape = MaterialTheme.shapes.extraLarge,
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            containerColor = if (current) {
+                MaterialTheme.colorScheme.surfaceContainerHigh
+            } else {
+                MaterialTheme.colorScheme.surfaceContainer
+            },
         ),
     ) {
         Column(
@@ -297,12 +328,36 @@ private fun SessionCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                RunningDot(attention, activityColor(view))
-                Text(
-                    view.label,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (attention) activityColor(view) else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                if (waiting) {
+                    // 药丸 = 形状呼吸点 + 标签：扫读时靠色块而非小字跳出"需要你"
+                    Row(
+                        Modifier
+                            .clip(MaterialTheme.shapes.small)
+                            .background(MaterialTheme.colorScheme.tertiaryContainer)
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RunningDot(
+                            running = true,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                            shape = MaterialShapes.Cookie9Sided.toShape(),
+                            size = AttentionDotSize,
+                        )
+                        Text(
+                            view.label,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        )
+                    }
+                } else {
+                    RunningDot(attention, activityColor(view))
+                    Text(
+                        view.label,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (attention) activityColor(view) else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Text(
                     relativeTimeLabel(session.updatedAt, System.currentTimeMillis()),
                     style = MaterialTheme.typography.labelMedium,
@@ -331,9 +386,14 @@ private fun SessionCard(
     }
 }
 
-/** 需要注意时 = 呼吸动画的状态点；否则静态点。 */
+/** 状态点：running = 呼吸动画；shape 默认圆，可换 MaterialShapes（等待态用 Cookie）。 */
 @Composable
-private fun RunningDot(running: Boolean, color: Color) {
+private fun RunningDot(
+    running: Boolean,
+    color: Color,
+    shape: Shape = CircleShape,
+    size: Dp = StatusDotSize,
+) {
     if (running) {
         val transition = rememberInfiniteTransition(label = "runningDot")
         val alpha by transition.animateFloat(
@@ -344,16 +404,16 @@ private fun RunningDot(running: Boolean, color: Color) {
         )
         Box(
             Modifier
-                .size(StatusDotSize)
+                .size(size)
                 .alpha(alpha)
-                .clip(CircleShape)
+                .clip(shape)
                 .background(color)
         )
     } else {
         Box(
             Modifier
-                .size(StatusDotSize)
-                .clip(CircleShape)
+                .size(size)
+                .clip(shape)
                 .background(color)
         )
     }

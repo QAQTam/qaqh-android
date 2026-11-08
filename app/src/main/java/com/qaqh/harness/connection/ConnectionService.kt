@@ -15,10 +15,14 @@ import com.qaqh.harness.MainActivity
 import com.qaqh.harness.R
 import com.qaqh.harness.data.core.CoreConnection
 import com.qaqh.harness.data.core.CoreFrame
+import com.qaqh.harness.data.core.CoreJson
 import com.qaqh.harness.data.core.SessionEvent as ContractSessionEvent
 import com.qaqh.harness.data.pairing.CredentialStore
 import com.qaqh.harness.data.ringing.model.ApprovalChallenge
 import com.qaqh.harness.data.ringing.model.ApprovalDecisions
+import com.qaqh.harness.data.ringing.model.AskAnswer
+import com.qaqh.harness.data.ringing.model.AskForm
+import com.qaqh.harness.data.ringing.model.AskSubmission
 import com.qaqh.harness.data.ringing.model.InteractionKinds
 import com.qaqh.harness.data.ringing.model.InteractionResolved
 import com.qaqh.harness.data.ringing.model.SessionListEntry
@@ -39,10 +43,14 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.decodeFromJsonElement
 
 /**
  * 服务作用域的最后一道闸:任何逃逸出各循环 try/catch 的异常都在这里落地成日志。
@@ -55,12 +63,15 @@ internal val serviceExceptionGuard =
 
 /** 当前待审批(kind=permission/ask/plan)投影。 */
 data class PendingApproval(
+    val sessionId: String,
     val interactionId: String,
     /** permission | ask | plan */
     val kind: String,
     val callId: String?,
     val summary: String,
     val expiresAtMs: Long?,
+    val detailsUnavailable: Boolean = false,
+    val askForm: AskForm? = null,
 )
 
 /**
@@ -163,7 +174,7 @@ class ConnectionService : Service() {
             }
             // device 身份:待审批整体以 challenge 快照为准,每轮顺带刷新
             if (deviceScope != null) {
-                currentSessionId?.let { refreshChallenges(conn, it) }
+                conn.currentSessionId()?.let { refreshChallenges(conn, it) }
             }
             delay(15_000)
         }
@@ -212,15 +223,34 @@ class ConnectionService : Service() {
                     return
                 }
                 val r = event.requested
+                val conn = connection ?: return
+                if (conn.currentSessionId() != r.sessionId) return
+                val text = interactionText(conn, r.request)
+                if (conn.currentSessionId() != r.sessionId) return
+                val body = text?.let { runCatching { CoreJson.parseToJsonElement(it) }.getOrNull() }
+                val ask = if (r.kind == InteractionKinds.ASK) decodeAskForm(body) else null
+                val permission = if (r.kind == InteractionKinds.PERMISSION) permissionSummary(body) else null
                 val approval = PendingApproval(
+                    sessionId = r.sessionId,
                     interactionId = r.interactionId,
                     kind = r.kind,
                     callId = r.callId,
-                    summary = extractSummary(r),
+                    summary = ask?.summary ?: when (r.kind) {
+                        InteractionKinds.PERMISSION -> permission ?: "工具调用请求"
+                        InteractionKinds.PLAN -> text ?: "计划评审"
+                        else -> "提问"
+                    },
                     expiresAtMs = r.expiresAtMs,
+                    detailsUnavailable = when (r.kind) {
+                        InteractionKinds.PERMISSION -> permission == null
+                        InteractionKinds.ASK -> ask == null
+                        else -> text.isNullOrBlank()
+                    },
+                    askForm = ask,
                 )
-                _pendingApprovals.value = _pendingApprovals.value + approval
-                notifyApproval(approval)
+                val previous = _pendingApprovals.value
+                _pendingApprovals.value = previous.filterNot { it.interactionId == r.interactionId } + approval
+                if (previous.none { it.interactionId == r.interactionId }) notifyApproval(approval)
             }
 
             is CoreConnection.SessionEvent.InteractionResolved -> {
@@ -256,51 +286,21 @@ class ConnectionService : Service() {
         refreshChallenges(conn, sid)
     }
 
-    private val summaryJson = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
-
-    /** ask 载荷({questions:[{question,options}...]},可能作为 JSON 字符串嵌在 text 里)→ 摘要。 */
-    private fun askSummaryOf(element: kotlinx.serialization.json.JsonElement?): String? {
-        val obj = element as? kotlinx.serialization.json.JsonObject ?: return null
-        val questions = obj["questions"] as? kotlinx.serialization.json.JsonArray ?: return null
-        val texts = questions.mapNotNull { q ->
-            ((q as? kotlinx.serialization.json.JsonObject)?.get("question") as? kotlinx.serialization.json.JsonPrimitive)
-                ?.content?.trim()?.takeIf { it.isNotEmpty() }
-        }
-        if (texts.isEmpty()) return null
-        return if (texts.size == 1) texts[0] else "共 ${texts.size} 问:${texts[0]}"
-    }
-
-    private suspend fun extractSummary(r: com.qaqh.harness.data.ringing.model.InteractionRequested): String {
-        // request 是 ContentValue {kind:"inline",data:{text:...}} 或 {kind:"ref",data:{content_ref:...}}
-        val data = (r.request as? kotlinx.serialization.json.JsonObject)?.get("data")
-            as? kotlinx.serialization.json.JsonObject
-        (data?.get("text") as? JsonPrimitive)?.content?.let { text ->
-            // ask 载荷常以 JSON 字符串嵌在 text 里:能解析出 questions 就取问题文本
-            runCatching { summaryJson.parseToJsonElement(text) }.getOrNull()?.let { parsed ->
-                askSummaryOf(parsed)?.let { return it }
+    private suspend fun interactionText(
+        conn: CoreConnection,
+        request: JsonElement?,
+    ): String? {
+        val body = request as? JsonObject ?: return null
+        val data = body["data"] as? JsonObject ?: return null
+        return when ((body["kind"] as? JsonPrimitive)?.content) {
+            "inline" -> (data["text"] as? JsonPrimitive)?.content
+            "ref" -> data["content_ref"]?.let { ref ->
+                runCatching { withTimeoutOrNull(5_000) { conn.client.contentText(ref.toString()) } }
+                    .getOrNull()
             }
-            return text
+            else -> null
         }
-        askSummaryOf(data)?.let { return it }
-        // ref 型:拉原文;原文可能是 ask 载荷 JSON、{"text":...} 或纯文本
-        val contentRef = (data?.get("content_ref") as? JsonPrimitive)?.content
-        if (contentRef != null) {
-            val conn = connection ?: return fallbackSummary(r)
-            val raw = runCatching {
-                withTimeoutOrNull(5_000) { conn.client.contentText(contentRef) }
-            }.getOrNull()
-            if (!raw.isNullOrBlank()) {
-                val parsed = runCatching { summaryJson.parseToJsonElement(raw) }.getOrNull()
-                askSummaryOf(parsed)?.let { return it }
-                val parsedText = (parsed as? JsonObject)?.get("text") as? JsonPrimitive
-                return parsedText?.content ?: raw.take(300)
-            }
-        }
-        return fallbackSummary(r)
     }
-
-    private fun fallbackSummary(r: com.qaqh.harness.data.ringing.model.InteractionRequested): String =
-        r.callId ?: "工具调用请求"
 
     // ---------- 通知 ----------
 
@@ -500,13 +500,18 @@ class ConnectionService : Service() {
          * canonical id 不出 daemon——device 模式待审批列表**整体以快照为准**,SSE 只作
          * 立即刷新的触发器。刷新时机 = 会话发现循环每 15s + SSE 交互事件 + 应答成功后。
          */
-        private suspend fun refreshChallenges(conn: CoreConnection, sessionId: String) {
-            if (_connectionState.value !is CoreConnection.State.Connected) return
+        private val challengeRefresh = Mutex()
+
+        private suspend fun refreshChallenges(conn: CoreConnection, sessionId: String) = challengeRefresh.withLock {
+            if (_connectionState.value !is CoreConnection.State.Connected ||
+                conn.currentSessionId() != sessionId
+            ) return@withLock
             val approvals = runCatching {
                 withTimeoutOrNull(10_000) { conn.client.deviceChallenges(sessionId) }
             }.onFailure {
                 android.util.Log.w(TAG, "challenges refresh failed: ${it.message}")
-            }.getOrNull() ?: return
+            }.getOrNull() ?: return@withLock
+            if (conn.currentSessionId() != sessionId || connection !== conn) return@withLock
             val svc = running
             val mapped = approvals.map { c ->
                 val kind = when (c.kind) {
@@ -516,14 +521,18 @@ class ConnectionService : Service() {
                     else -> c.kind
                 }
                 val previous = _pendingApprovals.value.firstOrNull { it.interactionId == c.challengeId }
+                val ask = if (kind == InteractionKinds.ASK) decodeAskForm(c.details) else null
                 PendingApproval(
+                    sessionId = sessionId,
                     interactionId = c.challengeId,
                     kind = kind,
                     callId = null,
-                    summary = previous?.summary ?: challengeSummaryOf(c, svc),
+                    summary = ask?.summary ?: challengeSummaryOf(c),
                     // 首次签发时算的到期时间保留,避免每轮刷新把通知倒计时重置
                     expiresAtMs = previous?.expiresAtMs
                         ?: c.expiresInSeconds?.let { System.currentTimeMillis() + it * 1000 },
+                    detailsUnavailable = c.detailsUnavailable || (kind == InteractionKinds.ASK && ask == null),
+                    askForm = ask,
                 )
             }
             val previousList = _pendingApprovals.value
@@ -540,7 +549,7 @@ class ConnectionService : Service() {
         }
 
         /** challenge details → 摘要。permission 是白名单字段投影;ask/plan 是交互正文原样。 */
-        private fun challengeSummaryOf(c: ApprovalChallenge, svc: ConnectionService?): String = when (c.kind) {
+        private fun challengeSummaryOf(c: ApprovalChallenge): String = when (c.kind) {
             ApprovalChallenge.KIND_TOOL_PERMISSION -> {
                 val d = c.permissionDetails
                 listOfNotNull(
@@ -549,7 +558,7 @@ class ConnectionService : Service() {
                     d?.paths?.firstOrNull(),
                 ).joinToString(" · ").ifBlank { "工具调用请求" }
             }
-            ApprovalChallenge.KIND_ASK -> svc?.askSummaryOf(c.details) ?: "提问"
+            ApprovalChallenge.KIND_ASK -> "提问"
             else -> (c.details as? JsonObject)?.let { o ->
                 listOf("plan", "text", "summary", "title").firstNotNullOfOrNull { key ->
                     (o[key] as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
@@ -566,21 +575,28 @@ class ConnectionService : Service() {
             context: Context,
             approval: PendingApproval,
             approved: Boolean,
+            answers: List<AskAnswer>? = null,
         ): Result<CommandAck> {
-            val conn = connection ?: return Result.failure(IllegalStateException("未连接"))
-            val sessionId = conn.currentSessionId()
-                ?: return Result.failure(IllegalStateException("无目标会话"))
+            val conn = connection
+            val sessionId = approval.sessionId
             val isDevice = deviceScope != null
             val result = runCatching {
+                check(conn != null && conn.currentSessionId() == sessionId) { "审批所属会话已切换" }
+                check(!approval.detailsUnavailable || (!approved && answers == null)) { "审批详情不可用" }
                 withContext(Dispatchers.IO) {
                     if (isDevice) {
                         val decision = when (approval.kind) {
-                            InteractionKinds.ASK -> ApprovalDecisions.DISMISS
+                            InteractionKinds.ASK ->
+                                if (answers == null) ApprovalDecisions.DISMISS else ApprovalDecisions.SUBMIT
                             else -> if (approved) ApprovalDecisions.APPROVE else ApprovalDecisions.REJECT
                         }
-                        conn.client.respondDeviceApproval(sessionId, approval.interactionId, decision)
+                        val payload = answers?.let { CoreJson.encodeToString(AskSubmission(it)) }
+                        conn.client.respondDeviceApproval(sessionId, approval.interactionId, decision, payload)
                     } else {
-                        conn.respondInteraction(approval.kind, approval.interactionId, approval.callId, approved)
+                        conn.respondInteraction(
+                            sessionId, approval.kind, approval.interactionId, approval.callId, approved,
+                            answers?.let { CoreJson.encodeToString(it) },
+                        )
                     }
                 }
             }
@@ -597,15 +613,25 @@ class ConnectionService : Service() {
                         .cancel(APPROVAL_NOTIFICATION_BASE + approval.interactionId.hashCode())
                     _pendingApprovals.value =
                         _pendingApprovals.value.filterNot { it.interactionId == approval.interactionId }
-                    if (isDevice) {
-                        // challenge 已一次性消费:立即刷新快照(回收空位/承接新签发)
-                        runCatching { refreshChallenges(conn, sessionId) }
-                    }
                 }
             }.onFailure { e ->
                 _lastRespondError.value = "应答失败:${e.message ?: e.javaClass.simpleName}"
             }
+            // 服务端先消费 challenge 再处理命令，应答失败时也需要刷新。
+            if (isDevice && conn != null) refreshChallenges(conn, sessionId)
             return result
+        }
+
+        private fun decodeAskForm(body: JsonElement?): AskForm? =
+            body?.let { runCatching { CoreJson.decodeFromJsonElement<AskForm>(it) }.getOrNull() }
+                ?.takeIf { it.questions.isNotEmpty() }
+
+        private fun permissionSummary(body: JsonElement?): String? {
+            val details = body as? JsonObject ?: return null
+            val tool = (details["tool_name"] as? JsonPrimitive)?.content ?: return null
+            val description = ((details["action_summary"] ?: details["reason"]) as? JsonPrimitive)?.content
+                ?: return null
+            return "$tool · $description"
         }
 
         /** 待办实况通知(Android 16 Live Updates / ColorOS 16 流体云胶囊)。 */

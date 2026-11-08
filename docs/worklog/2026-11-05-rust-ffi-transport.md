@@ -142,3 +142,16 @@ QAQH_DATA_DIR=/tmp/e2e/qaqh,LAN+TLS)。
 **留给用户:** daemon 仍在跑(/tmp/e2e/qaqh,token 在 /tmp/e2e/token.env);
 手机已配对可直接继续体验;配 provider 后即可真模型对话。重启 daemon 后
 手机端走既有 device_token 自动重连(daemon.json 换 epoch 会触发重协商)。
+
+## 收尾(03:10)
+
+- release .so:arm64-v8a 4.6MB / x86_64 5.5MB(LTO 全量,无 OOM);最终 APK
+  (3.0.0-alpha.1 + release core)重装真机 → 自动重连,设备心跳 1.2s,
+  历史会话/轮次完整显示。
+- daemon 重启自愈验证:换代 epoch 后 10.9s 手机重新上线(Rust 侧重协商+重
+  attach+流恢复全自动)。
+- 提交索引(本仓):64d710e → 2b4c6b2 → 38d7325 → a2ef8c7 → 613dfca;
+  (后端仓):2c6d53ea → dca885d6 → e39fa49a。
+- 供用户:daemon 仍在跑(QAQH_DATA_DIR=/tmp/e2e/qaqh,token /tmp/e2e/token.env,
+  loopback 端口每次重启会变——读 daemon.json);手机已配对即开即用;
+  配置 provider 后可真模型对话。恢复生产环境时把 QAQH_DATA_DIR 指回默认即可。

@@ -1,71 +1,55 @@
 #!/usr/bin/env bash
-# build-core.sh —— 交叉编译 Rust core(.so)并生成 UniFFI Kotlin 绑定,装入 app。
-#
-# 前置环境(本机已就绪,重装时参照):
-#   1. source /home/qaqtamsy/Projects/hiandroid/env.sh   # ANDROID_HOME(SDK 根)
-#   2. sdkmanager "ndk;30.0.16248370"                    # NDK
-#   3. rustup target add aarch64-linux-android x86_64-linux-android
-#   4. cargo install cargo-ndk
-#
-# 用法:
-#   ./core/build-core.sh            # 默认 debug(迭代快,内存友好)
-#   ./core/build-core.sh release    # 发布(继承 workspace LTO,注意内存门控)
-#
-# 资源门控:8G 内存机器,zram swap 已满时 cargo 可能 OOM——脚本内置 free 检查。
 set -euo pipefail
 
-PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BACKEND="$PROJ/../qaqh-backend"
+PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BACKEND="$(cd "${QAQH_BACKEND_DIR:-$PROJECT/../qaqh-backend}" && pwd)"
 PROFILE="${1:-debug}"
-ABIS=("arm64-v8a" "x86_64")
-TARGETS=("aarch64-linux-android" "x86_64-linux-android")
+NDK_VERSION=30.0.16248370
+ABIS=(arm64-v8a x86_64)
 
-source /home/qaqtamsy/Projects/hiandroid/env.sh >/dev/null
+case "$PROFILE" in
+    debug) PROFILE_ARGS=() ;;
+    release) PROFILE_ARGS=(--release) ;;
+    *) echo "Usage: $0 [debug|release]" >&2; exit 2 ;;
+esac
 
-# ── 资源门控 ────────────────────────────────────────────────────────────
-AVAIL_MB=$(free -m | awk 'NR==2{print $7}')
-if [ "${AVAIL_MB:-0}" -lt 2500 ]; then
-    echo "❌ 可用内存仅 ${AVAIL_MB}MB(<2500MB)。先 ./gradlew --stop 或等待回收。"
+SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+if [ -z "$SDK" ] && [ -f "$PROJECT/local.properties" ]; then
+    SDK=$(awk -F= '/^sdk.dir=/{sub(/^[^=]*=/, ""); print; exit}' "$PROJECT/local.properties")
+fi
+if [ -z "$SDK" ] || [ ! -d "$SDK/ndk/$NDK_VERSION" ]; then
+    echo "Set ANDROID_HOME to an SDK with NDK $NDK_VERSION installed." >&2
     exit 1
 fi
-echo "✅ 内存门控通过(可用 ${AVAIL_MB}MB)"
+export ANDROID_NDK_HOME="$(cd "$SDK/ndk/$NDK_VERSION" && pwd)"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 
-# ── Rust .so ────────────────────────────────────────────────────────────
-FLAGS=(--lib -p qaqh-ffi)
-[ "$PROFILE" = "release" ] && FLAGS+=(--release)
-(cd "$BACKEND" && cargo ndk \
-    $(for t in "${ABIS[@]}"; do printf -- "-t %s " "$t"; done) \
-    -o "$PROJ/app/src/main/jniLibs" \
-    build "${FLAGS[@]}")
+OUTPUT="$PROJECT/app/build/rust-core/$PROFILE"
+mkdir -p "$OUTPUT"
+STAGE=$(mktemp -d "$OUTPUT/stage.XXXXXX")
+trap 'rm -rf -- "$STAGE"' EXIT
 
-# ── strip + C++ 运行时 ──────────────────────────────────────────────────
-# libqaqh_ffi.so 依赖 libc++_shared.so(NDK clang 链接的 C++ 运行时),必须随包。
-NDK_DIR=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)
-STRIP="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-declare -A ABI_MAP=( ["arm64-v8a"]="aarch64-linux-android" ["x86_64"]="x86_64-linux-android" )
+cd "$BACKEND"
+cargo ndk -t arm64-v8a -t x86_64 --platform 21 --link-libcxx-shared \
+    -o "$STAGE/jniLibs" build --locked --lib -p qaqh-ffi "${PROFILE_ARGS[@]}"
+
+BINDGEN_LIBRARY="$STAGE/jniLibs/arm64-v8a/libqaqh_ffi.so"
+if [ "$PROFILE" = release ]; then
+    # The workspace release profile strips the symbol table used by bindgen.
+    cargo build --locked --lib -p qaqh-ffi --target-dir "$BACKEND/target"
+    HOST_LIBRARY=$(rustc --print file-names --crate-name qaqh_ffi --crate-type cdylib - </dev/null)
+    BINDGEN_LIBRARY="$BACKEND/target/debug/$HOST_LIBRARY"
+fi
+
+cargo run --locked -p qaqh-ffi --bin uniffi-bindgen -- generate \
+    --library "$BINDGEN_LIBRARY" \
+    --language kotlin --config crates/qaqh-ffi/uniffi-global.toml \
+    --out-dir "$STAGE/bindings" --no-format
+
+BINDING=com/qaqh/harness/core/ffi/qaqh_ffi.kt
+cp "$STAGE/bindings/$BINDING" "$PROJECT/app/src/main/java/$BINDING"
 for abi in "${ABIS[@]}"; do
-    so="$PROJ/app/src/main/jniLibs/$abi/libqaqh_ffi.so"
-    [ -f "$so" ] && "$STRIP" "$so"
-    cp "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${ABI_MAP[$abi]}/libc++_shared.so" \
-       "$PROJ/app/src/main/jniLibs/$abi/libc++_shared.so"
+    mkdir -p "$OUTPUT/jniLibs/$abi"
+    cp "$STAGE/jniLibs/$abi/"{libqaqh_ffi.so,libc++_shared.so} "$OUTPUT/jniLibs/$abi/"
 done
-
-# ── Kotlin 绑定 ─────────────────────────────────────────────────────────
-# host 侧 cdylib(--library 需要);debug 产物即可,metadata 与 profile 无关。
-(cd "$BACKEND" && cargo build -q -p qaqh-ffi --lib)
-(cd "$BACKEND" && cargo run -q -p qaqh-ffi --bin uniffi-bindgen -- generate \
-    --library target/debug/libqaqh_ffi.so \
-    --language kotlin \
-    --config crates/qaqh-ffi/uniffi-global.toml \
-    --out-dir "$PROJ/app/src/main/java" \
-    --no-format)
-
-# ── 产物清单 ────────────────────────────────────────────────────────────
-echo "── 产物 ──"
-for abi in "${ABIS[@]}"; do
-    so="$PROJ/app/src/main/jniLibs/$abi/libqaqh_ffi.so"
-    [ -f "$so" ] && du -h "$so"
-done
-KT=$(find "$PROJ/app/src/main/java/com/qaqh/harness/core/ffi" -name "*.kt" | head -1)
-[ -n "$KT" ] && echo "bindings: ${KT#$PROJ/}"
-echo "✅ core 构建完成($PROFILE)"
+echo "Rust core ($PROFILE): $OUTPUT/jniLibs"

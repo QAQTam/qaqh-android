@@ -145,21 +145,25 @@ class CoreConnection(
 
     /** 按交互类型应答(admin/Direct 身份的 canonical 命令通道)。 */
     suspend fun respondInteraction(
+        sessionId: String,
         kind: String,
         interactionId: String,
         callId: String?,
         approved: Boolean,
+        answersJson: String?,
     ): CommandAck {
-        val seed = _sessionSeed.value ?: error("no session")
         return when (kind) {
             InteractionKinds.PERMISSION -> client.respondToolPermission(
-                seed,
+                sessionId,
                 callId ?: error("permission 交互缺少 call_id"),
                 approved,
             )
-            InteractionKinds.PLAN -> client.respondPlanReview(seed, interactionId, approved)
-            // ask 的"拒绝"语义 = 关闭交互(中止挂起回合)
-            InteractionKinds.ASK -> client.dismissAsk(seed, interactionId)
+            InteractionKinds.PLAN -> client.respondPlanReview(sessionId, interactionId, approved)
+            InteractionKinds.ASK -> if (answersJson == null) {
+                client.dismissAsk(sessionId, interactionId)
+            } else {
+                client.respondAsk(sessionId, interactionId, answersJson)
+            }
             else -> error("未知交互类型 $kind")
         }
     }
@@ -233,6 +237,7 @@ class CoreConnection(
                             _events.tryEmit(
                                 SessionEvent.InteractionRequested(
                                     InteractionRequested(
+                                        sessionId = frame.sessionId,
                                         interactionId = v.interactionId,
                                         callId = v.callId,
                                         kind = v.kind,
@@ -305,10 +310,11 @@ class CoreConnection(
             _snapshots.tryEmit(Snapshot(sessionId, boot, boot.state.seq))
             _latestSnapshot.value = Snapshot(sessionId, boot, boot.state.seq)
             // 快照内已挂起的交互也要投影(重连/后加入的客户端看到积压请求)
-            boot.state.interactions.forEach { v ->
+            boot.state.interactions.filter { it.resolution == null }.forEach { v ->
                 _events.tryEmit(
                     SessionEvent.InteractionRequested(
                         InteractionRequested(
+                            sessionId = sessionId,
                             interactionId = v.interactionId,
                             callId = v.callId,
                             kind = v.kind,

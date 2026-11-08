@@ -73,7 +73,7 @@ class SessionGroupingTest {
     @Test
     fun `waiting states are derived from pending approvals`() {
         fun approval(kind: String) = com.qaqh.harness.connection.PendingApproval(
-            interactionId = "i", kind = kind, callId = null, summary = "s", expiresAtMs = null,
+            sessionId = "x", interactionId = "i", kind = kind, callId = null, summary = "s", expiresAtMs = null,
         )
         // 交互挂起覆盖执行中（control 投影在 interaction 期间仍报 running）
         assertEquals(ActivityView.WAITING_PERMISSION, activityViewOf(null, "running", listOf(approval("permission"))))
@@ -142,7 +142,7 @@ class SessionGroupingTest {
         val waiting = SessionListEntry(sessionId = "x", status = "waiting_ask")
         val notRunning = SessionListEntry(sessionId = "x", status = "not_running")
         fun approval(kind: String) = com.qaqh.harness.connection.PendingApproval(
-            interactionId = "i", kind = kind, callId = null, summary = "s", expiresAtMs = null,
+            sessionId = "x", interactionId = "i", kind = kind, callId = null, summary = "s", expiresAtMs = null,
         )
         // 回合先于轮询开始：live working 升 idle / not_running / 驻留终态
         assertEquals(ActivityView.WORKING, activityViewOf(idle, "running", emptyList()))

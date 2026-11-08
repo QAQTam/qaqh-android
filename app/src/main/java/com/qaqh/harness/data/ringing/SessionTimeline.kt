@@ -172,6 +172,20 @@ class SessionTimeline(
         toolsByCall.clear()
         state.tools.forEach { toolsByCall[it.callId] = it.toTool() }
         for (entry in parseTimelineEntries(state.timeline)) ingestEntry(entry)
+        // 快照回合终态:outcome 有值 = 已定稿(sealTurn 推进块级 state,markdown 分支才会
+        // 打开);无 outcome 的按 phase 恢复 running/非进行中。不消费 turns 的话,
+        // ensureTurn 的硬编码会让重进的会话永远 "running" + 流式裸文本(v3 e2e 实测)。
+        for (turnView in state.turns) {
+            val existing = turnsById[turnView.turnId] ?: continue
+            val stateLabel = turnView.stateLabel
+            turnsById[turnView.turnId] = when {
+                stateLabel != null -> sealTurn(existing, stateLabel)
+                else -> existing.copy(
+                    sealed = false,
+                    state = if (turnView.phase == "running") "running" else "open",
+                )
+            }
+        }
         // 快照内的待办:tools 里最后一个 todo 工具的参数即现状
         state.tools.lastOrNull { TodoState.isTodoTool(it.toolName) }?.let { tool ->
             _todos.value = TodoState.ingestTool(null, tool.toolName, tool.args?.toString())
@@ -338,7 +352,7 @@ class SessionTimeline(
                     else -> outcome.obj("data")?.str("terminal") ?: "completed"
                 }
                 turnsById[event.turnId]?.let {
-                    turnsById[event.turnId] = it.copy(sealed = true, state = state)
+                    turnsById[event.turnId] = sealTurn(it, state)
                 }
                 publishTurns()
             }
@@ -412,6 +426,18 @@ class SessionTimeline(
     }
 
     private fun toolBlockId(callId: String) = "tool:$callId"
+
+    /**
+     * 回合定稿:turn 置 sealed/state,块级 state 同步推进——BlockItem 的 markdown
+     * 分支以 block.state == "sealed" 为闸门,不推块级就永远流式纯文本。
+     */
+    private fun sealTurn(turn: TimelineTurn, state: String): TimelineTurn = turn.copy(
+        sealed = true,
+        state = state,
+        rounds = turn.rounds.map { round ->
+            round.copy(blocks = round.blocks.map { block -> block.copy(state = "sealed") })
+        },
+    )
 
     private fun addBlock(
         turn: TimelineTurn,

@@ -179,6 +179,66 @@ class SessionTimelineOrderingTest {
         )
     }
 
+    @Test
+    fun `turn_ended seals blocks so the markdown gate opens`() {
+        val t = timeline()
+        t.applyEventForTest(SessionEvent.TurnStarted("t1"))
+        t.applyEventForTest(SessionEvent.TimelineAppended(inputEntry("t1", "in1", "问")))
+        t.applyEventForTest(SessionEvent.MessageDelta("t1", "b1", "answer", "**markdown** 回答"))
+        assertTrue(
+            "前置:流式中块应为 open",
+            t.turnsForTest().single().rounds.single().blocks.all { it.state == "open" },
+        )
+        t.applyEventForTest(
+            SessionEvent.TurnEnded(
+                "t1",
+                buildJsonObject {
+                    put("kind", "finished")
+                    putJsonObject("data") { put("terminal", "completed") }
+                },
+            ),
+        )
+        val turn = t.turnsForTest().single()
+        assertTrue(turn.sealed)
+        assertEquals("completed", turn.state)
+        assertTrue("终态块必须 sealed(markdown 渲染闸门)", turn.rounds.single().blocks.all { it.state == "sealed" })
+    }
+
+    @Test
+    fun `bootstrap applies snapshot turn outcome - finished sealed, running stays live`() {
+        val t = timeline()
+        t.applyBootstrapForTest(
+            SessionState(
+                seq = 7,
+                turns = listOf(
+                    TurnView(
+                        turnId = "t1",
+                        outcome = buildJsonObject {
+                            put("kind", "finished")
+                            putJsonObject("data") { put("terminal", "completed") }
+                        },
+                    ),
+                    TurnView(turnId = "t2", phase = "running"),
+                ),
+                timeline = listOf(
+                    inputEntry("t1", "in1", "历史问"),
+                    assistantEntry("t1", "b1", "answer", "历史答"),
+                    inputEntry("t2", "in2", "进行中问"),
+                    assistantEntry("t2", "b2", "answer", "进行中答"),
+                ),
+            ),
+        )
+        val turns = t.turnsForTest()
+        val finished = turns.single { it.turnId == "t1" }
+        val running = turns.single { it.turnId == "t2" }
+        assertTrue("快照终态回合应 sealed(否则重进永远流式裸文本)", finished.sealed)
+        assertEquals("completed", finished.state)
+        assertTrue(finished.rounds.single().blocks.all { it.state == "sealed" })
+        assertTrue("进行中回合保持未定稿", !running.sealed)
+        assertEquals("running", running.state)
+        assertTrue(running.rounds.single().blocks.all { it.state == "open" })
+    }
+
     private fun block(id: String, kind: String, order: Int) =
         TimelineBlock(blockId = id, blockOrder = order, kind = kind)
 }
